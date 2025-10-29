@@ -500,6 +500,12 @@ class TabletopApp(App):
     def on_stop(self) -> None:  # pragma: no cover - framework callback
         root = cast(Optional[TabletopRoot], self.root)
 
+        if root is not None:
+            try:
+                root.notify_app_stopping()
+            except AttributeError:
+                pass
+
         process_handle: Optional[OverlayProcess]
         if root and getattr(root, "overlay_process", None):
             process_handle = cast(Optional[OverlayProcess], root.overlay_process)
