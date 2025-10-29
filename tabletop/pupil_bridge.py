@@ -8,12 +8,14 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from typing import Any, Dict, Iterable, Optional, Union
 
 try:  # pragma: no cover - optional dependency
-    from pupil_labs.realtime_api.simple import Device, discover_devices
+    from pupil_labs.realtime_api.simple import Device, DeviceError, discover_devices
 except Exception:  # pragma: no cover - optional dependency
     Device = None  # type: ignore[assignment]
+    DeviceError = None  # type: ignore[assignment]
     discover_devices = None  # type: ignore[assignment]
 
 try:  # pragma: no cover - optional dependency
@@ -37,6 +39,22 @@ VP2_PORT=8080
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "neon_devices.txt"
 
 _HEX_ID_PATTERN = re.compile(r"([0-9a-fA-F]{16,})")
+
+
+def _is_already_recording_error(exc: Exception) -> bool:
+    status = getattr(exc, "status", None)
+    args = getattr(exc, "args", ())
+    text = " ".join(str(part) for part in (str(exc),) + tuple(args)).lower()
+    if status == 400:
+        return "already recording" in text
+    if args and args[0] == 400:
+        return "already recording" in text
+    return False
+
+
+def _is_no_active_recording_error(exc: Exception) -> bool:
+    text = " ".join(str(part) for part in (str(exc),) + tuple(getattr(exc, "args", ())))
+    return "no active recording" in text.lower()
 
 
 def _ensure_config_file(path: Path) -> None:
@@ -164,6 +182,7 @@ class PupilBridge:
         self._auto_session: Optional[int] = None
         self._auto_block: Optional[int] = None
         self._auto_players: set[str] = set()
+        self._recording_lock = Lock()
 
     # ---------------------------------------------------------------------
     # Lifecycle management
@@ -356,26 +375,31 @@ class PupilBridge:
         return module_serial or ""
 
     def _auto_start_recording(self, player: str, device: Any) -> None:
-        if self._active_recording.get(player):
-            log.info("recording.start übersprungen (%s bereits aktiv)", player)
-            return
-        label = f"auto.{player.lower()}.{int(time.time())}"
-        log.info("recording.start gesendet (%s, label=%s)", player, label)
-        begin_info = self._send_recording_start(player, device, label)
-        if begin_info is None:
-            log.warning("recording.begin Timeout (%s)", player)
-            return
+        with self._recording_lock:
+            if self._active_recording.get(player):
+                log.info("Recording: start übersprungen (%s bereits aktiv)", player)
+                return
+            label = f"auto.{player.lower()}.{int(time.time())}"
+            log.info("Recording: start gesendet (%s, label=%s)", player, label)
+            begin_info, already_running = self._send_recording_start(player, device, label)
+            if begin_info is None and not already_running:
+                log.warning("Recording: begin Timeout (%s)", player)
+                return
 
-        recording_id = self._extract_recording_id(begin_info)
-        log.info("recording.begin bestätigt (%s, id=%s)", player, recording_id or "?")
+            recording_id = self._extract_recording_id(begin_info) if begin_info else None
+            if already_running:
+                log.info("Recording: bereits aktiv (%s)", player)
+            else:
+                log.info("Recording: begin bestätigt (%s, id=%s)", player, recording_id or "?")
 
-        self._active_recording[player] = True
-        self._recording_metadata[player] = {
-            "player": player,
-            "recording_label": label,
-            "event": "auto_start",
-            "recording_id": recording_id,
-        }
+            self._active_recording[player] = True
+            self._recording_metadata[player] = {
+                "player": player,
+                "recording_label": label,
+                "event": "auto_start",
+                "recording_id": recording_id,
+                "already_recording": already_running,
+            }
 
     def _get_device_status(self, device: Any) -> Optional[Any]:
         for attr in ("api_status", "status", "get_status"):
@@ -776,43 +800,48 @@ class PupilBridge:
     def start_recording(self, session: int, block: int, player: str) -> None:
         """Start a recording for the given player using the agreed label schema."""
 
-        device = self._device_by_player.get(player)
-        if device is None:
-            log.info("recording.start übersprungen (%s nicht verbunden)", player)
-            return
+        with self._recording_lock:
+            device = self._device_by_player.get(player)
+            if device is None:
+                log.info("Recording: start übersprungen (%s nicht verbunden)", player)
+                return
 
-        if self._active_recording.get(player):
-            log.debug("Recording already active for %s", player)
-            return
+            if self._active_recording.get(player):
+                log.debug("Recording: bereits aktiv für %s", player)
+                return
 
-        vp_index = self._PLAYER_INDICES.get(player, 0)
-        recording_label = f"{session}.{block}.{vp_index}"
+            vp_index = self._PLAYER_INDICES.get(player, 0)
+            recording_label = f"{session}.{block}.{vp_index}"
 
-        log.info("recording.start gesendet (%s, label=%s)", player, recording_label)
-        begin_info = self._send_recording_start(
-            player,
-            device,
-            recording_label,
-            session=session,
-            block=block,
-        )
-        if begin_info is None:
-            log.warning("Timeout, retry/abort (%s)", player)
-            return
+            log.info("Recording: start gesendet (%s, label=%s)", player, recording_label)
+            begin_info, already_running = self._send_recording_start(
+                player,
+                device,
+                recording_label,
+                session=session,
+                block=block,
+            )
+            if begin_info is None and not already_running:
+                log.warning("Recording: begin Timeout (%s)", player)
+                return
 
-        recording_id = self._extract_recording_id(begin_info)
-        log.info("recording.begin (%s, id=%s)", player, recording_id or "?")
+            recording_id = self._extract_recording_id(begin_info) if begin_info else None
+            if already_running:
+                log.info("Recording: bereits aktiv (%s)", player)
+            else:
+                log.info("Recording: begin (%s, id=%s)", player, recording_id or "?")
 
-        payload = {
-            "session": session,
-            "block": block,
-            "player": player,
-            "recording_label": recording_label,
-            "recording_id": recording_id,
-        }
-        self.send_event("session.recording_started", player, payload)
-        self._active_recording[player] = True
-        self._recording_metadata[player] = payload
+            payload = {
+                "session": session,
+                "block": block,
+                "player": player,
+                "recording_label": recording_label,
+                "recording_id": recording_id,
+                "already_recording": already_running,
+            }
+            self.send_event("session.recording_started", player, payload)
+            self._active_recording[player] = True
+            self._recording_metadata[player] = payload
 
     def _send_recording_start(
         self,
@@ -822,17 +851,23 @@ class PupilBridge:
         *,
         session: Optional[int] = None,
         block: Optional[int] = None,
-    ) -> Optional[Any]:
-        success, _ = self._invoke_recording_start(player, device)
-        if not success:
-            return None
+    ) -> tuple[Optional[Any], bool]:
+        status, payload = self._invoke_recording_start(player, device)
+        if status == "error":
+            return None, False
+
+        already_running = status == "already"
 
         self._apply_recording_label(player, device, label, session=session, block=block)
 
+        if already_running:
+            log.info("Recording: Gerät meldet laufende Aufnahme (%s)", player)
+            return {"already_recording": True, "payload": payload}, True
+
         begin_info = self._wait_for_notification(device, "recording.begin")
         if begin_info is None:
-            return None
-        return begin_info
+            return None, False
+        return begin_info, False
 
     def _invoke_recording_start(
         self,
@@ -840,14 +875,14 @@ class PupilBridge:
         device: Any,
         *,
         allow_busy_recovery: bool = True,
-    ) -> tuple[bool, Optional[Any]]:
+    ) -> tuple[str, Optional[Any]]:
         start_methods = ("recording_start", "start_recording")
         for method_name in start_methods:
             start_fn = getattr(device, method_name, None)
             if not callable(start_fn):
                 continue
             try:
-                return True, start_fn()
+                return "started", start_fn()
             except TypeError:
                 log.debug(
                     "recording start via %s requires unsupported arguments (%s)",
@@ -856,32 +891,41 @@ class PupilBridge:
                     exc_info=True,
                 )
             except Exception as exc:  # pragma: no cover - hardware dependent
+                if _is_already_recording_error(exc):
+                    log.info(
+                        "Recording: Gerät meldet bereits laufende Aufnahme über %s (%s)",
+                        method_name,
+                        player,
+                    )
+                    return "already", None
                 log.exception(
-                    "Failed to start recording for %s via %s: %s",
-                    player,
+                    "Recording: Start via %s fehlgeschlagen für %s: %s",
                     method_name,
+                    player,
                     exc,
                 )
-                return False, None
 
         rest_status, rest_payload = self._start_recording_via_rest(player)
         if rest_status == "busy" and allow_busy_recovery:
             if self._handle_busy_state(player, device):
                 return self._invoke_recording_start(player, device, allow_busy_recovery=False)
-            return False, None
-        if rest_status is True:
-            return True, rest_payload
-        log.error("No recording start method succeeded for %s", player)
-        return False, None
+            return "error", None
+        if rest_status == "already":
+            return "already", rest_payload
+        if rest_status == "ok":
+            return "started", rest_payload
+        if rest_status != "skip":
+            log.error("Recording: Kein Startverfahren erfolgreich für %s", player)
+        return "error", None
 
-    def _start_recording_via_rest(self, player: str) -> tuple[Optional[Union[str, bool]], Optional[Any]]:
+    def _start_recording_via_rest(self, player: str) -> tuple[str, Optional[Any]]:
         if requests is None:
-            log.debug("requests not available – cannot start recording via REST (%s)", player)
-            return False, None
+            log.debug("Recording: requests not available – cannot start via REST (%s)", player)
+            return "skip", None
         cfg = self._device_config.get(player)
         if cfg is None or not cfg.ip or cfg.port is None:
-            log.debug("REST recording start skipped (%s: no IP/port)", player)
-            return False, None
+            log.debug("Recording: REST start skipped (%s: no IP/port)", player)
+            return "skip", None
 
         url = f"http://{cfg.ip}:{cfg.port}/api/recording"
         try:
@@ -891,14 +935,14 @@ class PupilBridge:
                 timeout=self._connect_timeout,
             )
         except Exception as exc:  # pragma: no cover - network dependent
-            log.error("REST recording start failed for %s: %s", player, exc)
-            return False, None
+            log.error("Recording: REST start failed for %s: %s", player, exc)
+            return "error", None
 
         if response.status_code == 200:
             try:
-                return True, response.json()
+                return "ok", response.json()
             except ValueError:
-                return True, None
+                return "ok", None
 
         message: Optional[str] = None
         try:
@@ -913,19 +957,23 @@ class PupilBridge:
             and message
             and "previous recording not completed" in message.lower()
         ):
-            log.warning("Recording start busy for %s: %s", player, message)
+            log.warning("Recording: busy Start für %s: %s", player, message)
             return "busy", None
 
+        if response.status_code == 400 and message and "already recording" in message.lower():
+            log.info("Recording: REST meldet bereits aktive Aufnahme (%s)", player)
+            return "already", None
+
         log.error(
-            "REST recording start for %s failed (%s): %s",
+            "Recording: REST start für %s fehlgeschlagen (%s): %s",
             player,
             response.status_code,
             message or response.text,
         )
-        return False, None
+        return "error", None
 
     def _handle_busy_state(self, player: str, device: Any) -> bool:
-        log.info("Attempting to clear busy recording state for %s", player)
+        log.info("Recording: versuche busy-Aufnahmezustand zu lösen (%s)", player)
         stopped = False
         stop_fn = getattr(device, "recording_stop_and_save", None)
         if callable(stop_fn):
@@ -933,11 +981,7 @@ class PupilBridge:
                 stop_fn()
                 stopped = True
             except Exception as exc:  # pragma: no cover - hardware dependent
-                log.warning(
-                    "recording_stop_and_save failed for %s: %s",
-                    player,
-                    exc,
-                )
+                log.warning("Recording: recording_stop_and_save fehlgeschlagen (%s: %s)", player, exc)
 
         if not stopped:
             response = self._post_device_api(
@@ -949,18 +993,14 @@ class PupilBridge:
             if response is not None and response.status_code == 200:
                 stopped = True
             elif response is not None:
-                log.warning(
-                    "REST recording STOP for %s failed (%s)",
-                    player,
-                    response.status_code,
-                )
+                log.warning("Recording: REST STOP fehlgeschlagen für %s (%s)", player, response.status_code)
 
         if not stopped:
             return False
 
         end_info = self._wait_for_notification(device, "recording.end")
         if end_info is None:
-            log.warning("Timeout while waiting for recording.end (%s)", player)
+            log.warning("Recording: Timeout beim Warten auf recording.end (%s)", player)
         return True
 
     def _post_device_api(
@@ -1024,10 +1064,13 @@ class PupilBridge:
             warn=False,
         )
         if response is None:
-            log.warning("Setting frame_name failed for %s (no response)", player)
+            log.warning("Recording: frame_name konnte nicht gesetzt werden (%s, keine Antwort)", player)
+        elif response.status_code == 404:
+            log.info("Recording: frame_name-Endpunkt fehlt (%s)", player)
+            return
         elif response.status_code != 200:
             log.warning(
-                "Setting frame_name failed for %s (%s)",
+                "Recording: frame_name fehlgeschlagen für %s (%s)",
                 player,
                 response.status_code,
             )
@@ -1087,14 +1130,14 @@ class PupilBridge:
 
         device = self._device_by_player.get(player)
         if device is None:
-            log.info("recording.stop übersprungen (%s: nicht konfiguriert/verbunden)", player)
+            log.info("Recording: stop übersprungen (%s: nicht konfiguriert/verbunden)", player)
             return
 
         if not self._active_recording.get(player):
-            log.debug("No active recording to stop for %s", player)
+            log.info("Recording: stop übersprungen (%s: kein aktives Recording)", player)
             return
 
-        log.info("recording.stop (%s)", player)
+        log.info("Recording: stop (%s)", player)
 
         stop_payload = dict(self._recording_metadata.get(player, {"player": player}))
         stop_payload["player"] = player
@@ -1104,22 +1147,37 @@ class PupilBridge:
             player,
             stop_payload,
         )
-        try:
-            stop_fn = getattr(device, "recording_stop_and_save", None)
-            if callable(stop_fn):
-                stop_fn()
-            else:
-                log.warning("Device for %s lacks recording_stop_and_save", player)
-        except Exception as exc:  # pragma: no cover - hardware dependent
-            log.exception("Failed to stop recording for %s: %s", player, exc)
-            return
 
-        end_info = self._wait_for_notification(device, "recording.end")
-        if end_info is not None:
-            recording_id = self._extract_recording_id(end_info)
-            log.info("recording.end empfangen (%s, id=%s)", player, recording_id or "?")
+        expect_end = True
+        stop_fn = getattr(device, "recording_stop_and_save", None)
+        if callable(stop_fn):
+            try:
+                stop_fn()
+            except Exception as exc:  # pragma: no cover - hardware dependent
+                if _is_no_active_recording_error(exc):
+                    log.info(
+                        "Recording: stop ignoriert – kein aktives Recording laut Gerät (%s)",
+                        player,
+                    )
+                    expect_end = False
+                else:
+                    log.exception("Recording: stop fehlgeschlagen für %s: %s", player, exc)
+                    return
         else:
-            log.info("recording.end nicht bestätigt (%s)", player)
+            log.warning("Device for %s lacks recording_stop_and_save", player)
+            expect_end = False
+
+        if expect_end:
+            end_info = self._wait_for_notification(device, "recording.end")
+            if end_info is not None:
+                recording_id = self._extract_recording_id(end_info)
+                log.info(
+                    "Recording: end empfangen (%s, id=%s)",
+                    player,
+                    recording_id or "?",
+                )
+            else:
+                log.info("Recording: end nicht bestätigt (%s)", player)
 
         if player in self._active_recording:
             self._active_recording[player] = False

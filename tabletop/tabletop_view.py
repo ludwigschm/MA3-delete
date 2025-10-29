@@ -34,6 +34,7 @@ from tabletop.logging.round_csv import (
 from tabletop.overlay.fixation import (
     generate_fixation_tone,
     play_fixation_tone as overlay_play_fixation_tone,
+    cancel_fixation_sequence as overlay_cancel_fixation_sequence,
     run_fixation_sequence as overlay_run_fixation_sequence,
 )
 from tabletop.overlay.process import start_overlay_process, stop_overlay_process
@@ -115,6 +116,46 @@ class TabletopRoot(FloatLayout):
             return None
         return w
 
+    def _disable_start_button(self, player: int) -> None:
+        button = self.wid_safe(f"btn_start_p{player}")
+        if button is None:
+            return
+        button.disabled = True
+        if hasattr(button, "set_live"):
+            try:
+                button.set_live(False)
+            except ReferenceError:
+                return
+
+    def _set_start_buttons_disabled(self, disabled: bool) -> None:
+        for attr in ("btn_start_p1", "btn_start_p2"):
+            button = self.wid_safe(attr)
+            if button is None:
+                continue
+            button.disabled = disabled
+            if disabled and hasattr(button, "set_live"):
+                try:
+                    button.set_live(False)
+                except ReferenceError:
+                    continue
+
+    def _maybe_enable_start_buttons(self) -> None:
+        if getattr(self, "fixation_running", False):
+            return
+        allowed_phase = self.phase in (UXPhase.WAIT_BOTH_START, UXPhase.SHOWDOWN)
+        if not allowed_phase and not self.in_block_pause:
+            return
+        for attr in ("btn_start_p1", "btn_start_p2"):
+            button = self.wid_safe(attr)
+            if button is None:
+                continue
+            button.disabled = False
+            if allowed_phase and hasattr(button, "set_live"):
+                try:
+                    button.set_live(True)
+                except ReferenceError:
+                    continue
+
     def __init__(
         self,
         *,
@@ -172,6 +213,10 @@ class TabletopRoot(FloatLayout):
         self.round_log_buffer = []
         self.overlay_display_index = 0
 
+        self._start_in_progress = False
+        self.app_stopping = False
+        self.screen_leaving = False
+
         self._bridge: Optional["PupilBridge"] = None
         self._bridge_player: Optional[str] = None
         self._bridge_players: set[str] = set()
@@ -198,6 +243,21 @@ class TabletopRoot(FloatLayout):
             Clock.schedule_once(self._configure_session_from_cli, 0.1)
         else:
             Clock.schedule_once(lambda *_: self.prompt_session_number(), 0.1)
+
+    def on_parent(self, widget, parent):
+        super().on_parent(widget, parent)
+        if parent is None:
+            self.screen_leaving = True
+            self.cancel_fixation_sequence("parent removed")
+
+    def notify_app_stopping(self) -> None:
+        if self.app_stopping:
+            return
+        self.app_stopping = True
+        self.cancel_fixation_sequence("app stopping")
+
+    def cancel_fixation_sequence(self, reason: str = "cancelled") -> None:
+        overlay_cancel_fixation_sequence(self, reason=reason)
 
     def __setattr__(self, key, value):
         if key in self._STATE_FIELDS and 'controller' in self.__dict__:
@@ -915,11 +975,20 @@ class TabletopRoot(FloatLayout):
             proceed()
 
     def start_pressed(self, who:int):
+        if getattr(self, "app_stopping", False) or getattr(self, "screen_leaving", False):
+            log.info("UI: Start ignored for VP%s – app stopping/leaving", who)
+            return
+        if getattr(self, "_start_in_progress", False):
+            log.info("UI: Start ignored for VP%s – already in progress", who)
+            return
         if self.session_finished and not self.in_block_pause:
             return
         allowed_phase = self.phase in (UXPhase.WAIT_BOTH_START, UXPhase.SHOWDOWN)
         if not allowed_phase and not self.in_block_pause:
             return
+
+        self._disable_start_button(who)
+
         if who == 1:
             self.p1_pressed = True
         else:
@@ -929,32 +998,36 @@ class TabletopRoot(FloatLayout):
             action = 'start_click' if self.phase == UXPhase.WAIT_BOTH_START else 'next_round_click'
             self.log_event(who, action)
         if self.p1_pressed and self.p2_pressed:
-            # in nächste Phase
             self.p1_pressed = False
             self.p2_pressed = False
-            if self.in_round_pause:
-                self.in_round_pause = False
-                self.pause_message = ''
-                self.update_pause_overlay()
-                self.prepare_next_round(start_immediately=True)
-                return
-            if self.in_block_pause:
-                self.in_block_pause = False
-                self.pause_message = ''
-                self.update_pause_overlay()
-                self.setup_round()
-                if self.session_finished:
-                    self.apply_phase()
+            self._set_start_buttons_disabled(True)
+            self._start_in_progress = True
+            try:
+                if self.in_round_pause:
+                    self.in_round_pause = False
+                    self.pause_message = ''
+                    self.update_pause_overlay()
+                    self.prepare_next_round(start_immediately=True)
                     return
-                self.phase = UXPhase.WAIT_BOTH_START
-                self.apply_phase()
+                if self.in_block_pause:
+                    self.in_block_pause = False
+                    self.pause_message = ''
+                    self.update_pause_overlay()
+                    self.setup_round()
+                    if self.session_finished:
+                        self.apply_phase()
+                        return
+                    self.phase = UXPhase.WAIT_BOTH_START
+                    self.apply_phase()
+                    self.continue_after_start_press()
+                    return
+                if self.phase == UXPhase.SHOWDOWN:
+                    self.prepare_next_round(start_immediately=True)
+                    return
                 self.continue_after_start_press()
-                return
-            elif self.phase == UXPhase.SHOWDOWN:
-                self.prepare_next_round(start_immediately=True)
-                return
-            else:
-                self.continue_after_start_press()
+            finally:
+                self._start_in_progress = False
+                self._maybe_enable_start_buttons()
 
     def run_fixation_sequence(self, on_complete=None):
         self.fixation_runner(
