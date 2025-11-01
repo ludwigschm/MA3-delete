@@ -5,8 +5,6 @@ from __future__ import annotations
 import argparse
 import os
 import math
-import random
-import statistics
 import time
 from collections import deque
 from contextlib import suppress
@@ -38,9 +36,6 @@ from tabletop.overlay.process import (
     stop_overlay,
 )
 from tabletop.tabletop_view import TabletopRoot
-from tabletop.pupil_bridge import PupilBridge
-from tabletop.engine import EventLogger
-from tabletop.sync.reconciler import TimeReconciler
 from tabletop.utils.runtime import (
     is_low_latency_disabled,
     is_perf_logging_enabled,
@@ -60,8 +55,6 @@ class TabletopApp(App):
         session: Optional[int] = None,
         block: Optional[int] = None,
         player: str = "auto",
-        players: Optional[Sequence[str]] = None,
-        bridge: Optional[PupilBridge] = None,
         single_block_mode: bool = False,
         logging_queue: Optional[Queue] = None,
         **kwargs: Any,
@@ -75,19 +68,8 @@ class TabletopApp(App):
         )
 
         self._configure_startup_display(self._target_display_index)
-        self._bridge: Optional[PupilBridge] = bridge
         self._session: Optional[int] = session
         self._block: Optional[int] = block
-        requested_players: set[str] = set()
-        if players is not None:
-            requested_players.update(players)
-        elif player:
-            lowered = player.lower()
-            if lowered == "both":
-                requested_players.update({"VP1", "VP2"})
-            elif lowered not in {"auto"}:
-                requested_players.add(player)
-        self._players: set[str] = {entry for entry in requested_players if entry}
         self._single_block_mode: bool = single_block_mode
         self._perf_logging: bool = is_perf_logging_enabled()
         self._low_latency_disabled: bool = is_low_latency_disabled()
@@ -310,53 +292,15 @@ class TabletopApp(App):
                 Builder.load_file(str(kv_path))
             _KV_LOADED = True
 
-        primary_player = next(iter(self._players), "")
         root = TabletopRoot(
-            bridge=self._bridge,
-            bridge_player=primary_player,
-            bridge_session=self._session,
-            bridge_block=self._block,
+            session=self._session,
+            block=self._block,
             single_block_mode=self._single_block_mode,
             perf_logging=self._perf_logging,
         )
-        # propagate multi-player context so the view can start/stop recordings for all
-        try:
-            root.update_bridge_context(
-                bridge=self._bridge,
-                players=set(self._players),
-                session=self._session,
-                block=self._block,
-            )
-        except Exception:
-            pass
 
         # ESC binding is scheduled in ``on_start`` once the window exists.
         return root
-
-    # ------------------------------------------------------------------
-    # Bridge helpers
-    def _bridge_payload_base(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {}
-        if self._session is not None:
-            payload["session"] = self._session
-        if self._block is not None:
-            payload["block"] = self._block
-        return payload
-
-    def _iter_active_players(self) -> list[str]:
-        if not self._bridge:
-            return []
-
-        players = set(self._players)
-        if not players:
-            try:
-                players = set(self._bridge.connected_players())
-            except AttributeError:
-                players = set()
-            if players:
-                self._players = set(players)
-
-        return [player for player in players if self._bridge.is_connected(player)]
 
     def _format_key_name(self, key: int, codepoint: str) -> str:
         if codepoint:
@@ -364,42 +308,6 @@ class TabletopApp(App):
                 return "space"
             return codepoint
         return f"code_{key}"
-
-    def _emit_bridge_key_event(
-        self,
-        action: str,
-        *,
-        key: int,
-        scancode: int,
-        codepoint: str,
-        modifiers: list[str],
-    ) -> None:
-        if not self._bridge:
-            return
-        key_name = self._format_key_name(key, codepoint)
-        event_name = f"key.{key_name}.{action}"
-        payload = self._bridge_payload_base()
-        payload.update(
-            {
-                "key": key_name,
-                "keycode": key,
-                "scancode": scancode,
-                "codepoint": codepoint,
-                "modifiers": modifiers,
-            }
-        )
-        root = cast(Optional[TabletopRoot], self.root)
-        if root is not None:
-            root.send_bridge_event(event_name, payload)
-            return
-
-        players = self._iter_active_players()
-        if not players:
-            return
-        for player in players:
-            payload_copy = dict(payload)
-            payload_copy["target_player"] = player
-            self._bridge.send_event(event_name, player, payload_copy)
 
     def _bind_esc(self) -> None:
         """Ensure ESC toggles fullscreen without closing the app."""
@@ -414,16 +322,6 @@ class TabletopApp(App):
             codepoint: str,
             modifiers: list[str],
         ) -> bool:
-            try:
-                self._emit_bridge_key_event(
-                    "down",
-                    key=key,
-                    scancode=scancode,
-                    codepoint=codepoint,
-                    modifiers=modifiers,
-                )
-            except Exception:  # pragma: no cover - defensive fallback
-                log.exception("Failed to emit bridge key down event")
             if key == 27:  # ESC
                 try:
                     if Window.fullscreen:
@@ -450,16 +348,6 @@ class TabletopApp(App):
             scancode: int,
             *args: Any,
         ) -> bool:
-            try:
-                self._emit_bridge_key_event(
-                    "up",
-                    key=key,
-                    scancode=scancode,
-                    codepoint="",
-                    modifiers=list(args[0]) if args and isinstance(args[0], (list, tuple)) else [],
-                )
-            except Exception:  # pragma: no cover - defensive fallback
-                log.exception("Failed to emit bridge key up event")
             return False
 
         self._key_up_handler = _on_key_up
@@ -510,14 +398,7 @@ class TabletopApp(App):
             if load >= 0.8 and now - self._last_queue_warning >= 1.0:
                 log.warning("Logging queue at %.0f%% capacity", load * 100.0)
                 self._last_queue_warning = now
-        bridge = self._bridge
-        if bridge is not None:
-            size, capacity = bridge.event_queue_load()
-            if capacity > 0:
-                load = size / capacity
-                if load >= 0.8 and now - self._last_queue_warning >= 1.0:
-                    log.warning("Pupil event queue at %.0f%% capacity", load * 100.0)
-                    self._last_queue_warning = now
+        _ = now  # suppress unused variable warning when bridge removed
 
     def _cancel_event(self, event: Any) -> None:
         if event is None:
@@ -529,17 +410,6 @@ class TabletopApp(App):
     def on_start(self) -> None:  # pragma: no cover - framework callback
         super().on_start()
         root = cast(Optional[TabletopRoot], self.root)
-
-        if root is not None:
-            try:
-                root.update_bridge_context(
-                    bridge=self._bridge,
-                    players=set(self._players),
-                    session=self._session,
-                    block=self._block,
-                )
-            except AttributeError:
-                pass
 
         self._target_display_index = self._determine_display_index()
         self._apply_display_environment(self._target_display_index)
@@ -645,16 +515,6 @@ class TabletopApp(App):
                     shutdown_sync()
                 except Exception:  # pragma: no cover - defensive fallback
                     log.debug("shutdown_sync_services raised", exc_info=True)
-            try:
-                root.stop_bridge_recordings()
-            except AttributeError:
-                pass
-        elif self._bridge is not None:
-            for player in self._iter_active_players():
-                try:
-                    self._bridge.stop_recording(player)
-                except Exception:  # pragma: no cover - defensive fallback
-                    log.exception("Failed to stop recording for %s", player)
 
         super().on_stop()
 
@@ -685,143 +545,15 @@ def _configure_async_logging() -> tuple[Optional[QueueListener], Optional[Queue]
     listener.daemon = True
     listener.start()
     return listener, log_queue
-
-
-def _resolve_requested_players(
-    player: str, *, connected: Optional[set[str]] = None
-) -> list[str]:
-    requested = (player or "auto").strip().lower()
-    connected = {p for p in (connected or set()) if p}
-
-    if requested == "auto":
-        if connected:
-            return sorted(connected)
-        return ["VP1"]
-
-    if requested == "both":
-        return ["VP1", "VP2"]
-
-    normalized = player.upper() if player else "VP1"
-    return [normalized]
-
-
-def run_demo(*, duration: float = 8.0, heartbeat_interval: float = 2.0) -> None:
-    """Run a console demo that showcases event refinement without the UI."""
-
-    class DemoBridge:
-        def __init__(self) -> None:
-            self._offsets = {"VP1": 0.250, "VP2": 0.320}
-            self._events: dict[str, dict[str, Any]] = {}
-
-        def connected_players(self) -> list[str]:
-            return list(self._offsets.keys())
-
-        def event_queue_load(self) -> tuple[int, int]:
-            return (0, 100)
-
-        def send_event(
-            self, name: str, player: str, payload: Optional[dict[str, Any]] = None
-        ) -> None:
-            payload = payload or {}
-            event_id = payload.get("event_id", "?")
-            mapping = payload.get("mapping_version")
-            print(
-                f"[demo] provisional {player}: {name} id={event_id} mapping={mapping}"
-            )
-            self._events[event_id] = payload
-
-        def refine_event(
-            self,
-            player: str,
-            event_id: str,
-            t_ref_ns: int,
-            *,
-            confidence: float,
-            mapping_version: int,
-            extra: Optional[dict[str, Any]] = None,
-        ) -> None:
-            print(
-                f"[demo] refined   {player}: id={event_id} -> {t_ref_ns}ns "
-                f"(v{mapping_version}, conf={confidence:.3f})"
-            )
-            if extra:
-                print(f"        extra={extra}")
-
-        def estimate_time_offset(self, player: str) -> Optional[float]:
-            base = self._offsets.get(player, 0.250)
-            drift = random.uniform(-0.00015, 0.00015)
-            noise = random.uniform(-0.0015, 0.0015)
-            updated = base + drift
-            self._offsets[player] = updated
-            return updated + noise
-
-    log.info("Starting refinement demo – this runs without the Kivy UI")
-    bridge = DemoBridge()
-    log_dir = Path.cwd() / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    db_path = log_dir / "demo_refinement.sqlite3"
-    try:
-        db_path.unlink()
-    except FileNotFoundError:
-        pass
-
-    logger = EventLogger(str(db_path))
-    reconciler = TimeReconciler(bridge, logger, window_size=8)
-    reconciler.start()
-    try:
-        start = time.perf_counter()
-        next_marker = start
-        counter = 0
-        while time.perf_counter() - start < duration:
-            t_local_ns = time.perf_counter_ns()
-            event_id = f"demo-{counter:04d}"
-            payload = {
-                "event_id": event_id,
-                "t_local_ns": t_local_ns,
-                "provisional": True,
-                "mapping_version": reconciler.current_mapping_version,
-                "origin_device": "demo_host",
-            }
-            for player in bridge.connected_players():
-                bridge.send_event("demo.button", player, dict(payload, player=player))
-            reconciler.on_event(event_id, t_local_ns)
-            counter += 1
-            now = time.perf_counter()
-            if now >= next_marker:
-                marker_ns = time.perf_counter_ns()
-                print(f"[demo] heartbeat marker emitted at {marker_ns}")
-                reconciler.submit_marker("demo.heartbeat", marker_ns)
-                next_marker = now + max(0.5, heartbeat_interval)
-            time.sleep(0.35)
-        time.sleep(1.0)
-    finally:
-        reconciler.stop()
-        logger.close()
-    print(f"[demo] SQLite refinements written to {db_path}")
-
-
 def main(
     *,
     session: Optional[int] = None,
     block: Optional[int] = None,
     player: str = "auto",
 ) -> None:
-    """Run the tabletop Kivy application with optional Pupil bridge integration."""
+    """Run the tabletop Kivy application."""
 
     logging_listener, logging_queue = _configure_async_logging()
-
-    bridge = PupilBridge()
-    try:
-        bridge.connect()
-    except Exception:  # pragma: no cover - defensive fallback
-        log.exception("Failed to connect to Pupil devices")
-
-    try:
-        connected_players = bridge.connected_players()
-    except AttributeError:
-        connected_players = set()
-
-    desired_players = _resolve_requested_players(player, connected=connected_players)
 
     single_block_mode = session is not None and block is not None
 
@@ -829,23 +561,12 @@ def main(
         session=session,
         block=block,
         player=player,
-        players=desired_players,
-        bridge=bridge,
         single_block_mode=single_block_mode,
         logging_queue=logging_queue,
     )
     try:
         app.run()
     finally:
-        for tracked in desired_players:
-            try:
-                bridge.stop_recording(tracked)
-            except Exception:  # pragma: no cover - defensive fallback
-                log.exception("Failed to stop recording during shutdown for %s", tracked)
-        try:
-            bridge.close()
-        except Exception:  # pragma: no cover - defensive fallback
-            log.exception("Failed to close Pupil bridge")
         if logging_listener is not None:
             logging_listener.stop()
 
@@ -855,13 +576,5 @@ if __name__ == "__main__":  # pragma: no cover - manual execution
     parser.add_argument("--session", type=int, default=None, help="Session identifier")
     parser.add_argument("--block", type=int, default=None, help="Block identifier")
     parser.add_argument("--player", default="auto", help="Player to control (VP1/VP2/both)")
-    parser.add_argument(
-        "--demo",
-        action="store_true",
-        help="Run the latency/refinement demo instead of launching the UI",
-    )
     args = parser.parse_args()
-    if args.demo:
-        run_demo()
-    else:
-        main(session=args.session, block=args.block, player=args.player)
+    main(session=args.session, block=args.block, player=args.player)
