@@ -551,6 +551,8 @@ class TabletopRoot(FloatLayout):
         self.total_rounds_planned = sum(len(block['rounds']) for block in self.blocks)
         self.overlay_process = self._aruco_proc
         self.fixation_running = False
+        # Hotfix flag: set True right after fixation to enforce second start press
+        self._fixation_just_finished = False
         self.fixation_required = False
         self.pending_fixation_callback = None
         self.intro_active = True
@@ -866,6 +868,12 @@ class TabletopRoot(FloatLayout):
             # in nächste Phase
             self.p1_pressed = False
             self.p2_pressed = False
+            # Hotfix: if fixation just finished, require a second press and remain in WAIT_BOTH_START
+            if getattr(self, '_fixation_just_finished', False) and self.phase == UXPhase.WAIT_BOTH_START:
+                self._fixation_just_finished = False
+                # Re-apply the phase to keep the waiting screen active; do not advance
+                self.apply_phase()
+                return
             if self.in_round_pause:
                 self.in_round_pause = False
                 self.pause_message = ''
@@ -891,12 +899,18 @@ class TabletopRoot(FloatLayout):
                 self.continue_after_start_press()
 
     def run_fixation_sequence(self, on_complete=None):
+        def _after_fixation_wrapper():
+            # Hotfix: require a second start press after fixation
+            self._fixation_just_finished = True
+            if callable(on_complete):
+                on_complete()
+
         self.fixation_runner(
             self,
             schedule_once=Clock.schedule_once,
             stop_image=FIX_STOP_IMAGE,
             live_image=FIX_LIVE_IMAGE,
-            on_complete=on_complete,
+            on_complete=_after_fixation_wrapper,
         )
 
     def play_fixation_tone(self):
