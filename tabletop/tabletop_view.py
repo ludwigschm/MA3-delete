@@ -1143,6 +1143,16 @@ class TabletopRoot(FloatLayout):
     def prepare_next_round(self, start_immediately: bool = False):
         result = self.controller.prepare_next_round(start_immediately=start_immediately)
         self.update_role_assignments()
+        if result.in_block_pause:
+            self.in_block_pause = True
+            self.pause_message = (
+                self.controller.state.pause_message
+                or self.build_round_pause_message(
+                    self.controller.state.next_block_preview
+                )
+            )
+            self.update_pause_overlay()
+            return
         self._apply_round_setup(result.setup)
         self.apply_phase()
         if result.session_finished:
@@ -1153,11 +1163,6 @@ class TabletopRoot(FloatLayout):
             self.update_pause_overlay()
             self.update_user_displays()
             self._stop_sync_session(reason='completed')
-            return
-        if result.in_block_pause:
-            self.in_block_pause = True
-            self.pause_message = self.controller.state.pause_message or ''
-            self.update_pause_overlay()
             return
 
         def start_round():
@@ -1494,17 +1499,18 @@ class TabletopRoot(FloatLayout):
 
     def build_round_pause_message(self, next_info: Optional[Dict[str, Any]]) -> str:
         base = (
-            "Pause. Atmen Sie kurz durch, wenn Sie bereit für die nächste Runde sind, "
-            "spielen Sie weiter."
+            "Pause. Atmen Sie kurz durch. Mit den Weiter-Tasten den nächsten Block beginnen. "
+            "Danach kommt die Fixationssequenz."
         )
         if not next_info:
             return base
         block = next_info.get('block') or {}
         payout = block.get('payout')
-        if payout:
-            suffix = 'In der nächsten Runde spielen Sie um Punkte und Lose.'
-        else:
-            suffix = 'In der nächsten Runde spielen Sie zum Spaß.'
+        suffix = (
+            'In der nächsten Runde spielen Sie um Punkte und Lose.'
+            if payout
+            else 'In der nächsten Runde spielen Sie zum Spaß.'
+        )
         return f"{base}\n{suffix}"
 
     def describe_level(self, level:str) -> str:

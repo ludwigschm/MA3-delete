@@ -379,6 +379,15 @@ class TabletopController:
         state.signaler, state.judge = state.judge, state.signaler
         self.update_turn_order()
         self.advance_round_pointer()
+        if state.in_block_pause:
+            return PrepareNextRoundResult(
+                setup=RoundSetupResult(plan=None),
+                in_block_pause=True,
+                requires_fixation=False,
+                session_finished=state.session_finished,
+                start_phase=None,
+                await_second_start=False,
+            )
         state.phase = UXPhase.WAIT_BOTH_START
         setup = self.setup_round()
         start_phase = None
