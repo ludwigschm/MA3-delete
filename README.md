@@ -16,3 +16,9 @@ einen hochauflösenden Zeitstempel (`t_local_ns`) auf Basis von
 `time.perf_counter_ns()`. Alle Ereignisse werden lokal im jeweiligen
 Session-Log (`logs/events_<session>.sqlite3`) und in den CSV-Rundendateien
 gespeichert. Die frühere Eye-Tracking-Integration wurde komplett entfernt.
+
+Für UI-/Spiel-Events wird vor dem Schreiben/Versenden die Hilfsfunktion
+`tabletop.logging.payload.enrich_payload(...)` verwendet. Sie ergänzt die
+gemeinsamen Felder `actor`, `game_player`, `player_role`, `phase` und
+`round_idx`, sodass Marker-Bridge, MarkerHub und Log-Dateien konsistente
+Metadaten enthalten.

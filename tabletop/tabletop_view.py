@@ -24,6 +24,7 @@ from kivy.uix.textinput import TextInput
 from tabletop.data.blocks import load_blocks, load_csv_rounds, value_to_card_path
 from tabletop.data.config import ARUCO_OVERLAY_PATH, ROOT
 from tabletop.logging.events import Events
+from tabletop.logging.payload import enrich_payload
 from tabletop.logging.round_csv import (
     close_round_log,
     init_round_log,
@@ -390,16 +391,15 @@ class TabletopRoot(FloatLayout):
             init_round_log(self)
             self.update_role_assignments()
 
-            self.log_event(
-                None,
-                'session_start',
-                {
-                    'session_number': self.session_number,
-                    'session_id': self.session_id,
-                    'aruco_enabled': self.aruco_enabled,
-                    'start_block': self.start_block,
-                },
-            )
+            base_payload = {
+                'session_number': self.session_number,
+                'session_id': self.session_id,
+                'aruco_enabled': self.aruco_enabled,
+                'start_block': self.start_block,
+            }
+            # enriched payload for consistent logging & markers (non-blocking)
+            payload = self._enrich_payload(base_payload, None)
+            self.log_event(None, 'session_start', payload)
             self._start_sync_session()
             self._apply_session_options_and_start()
             self._session_setup_in_progress = False
@@ -424,13 +424,15 @@ class TabletopRoot(FloatLayout):
                 self.eye_tracker_manager.start_all(session_id)
             except Exception:  # pragma: no cover - defensive
                 log.exception("Starting Neon devices failed")
-        marker_payload = {
+        base_payload = {
             'session': session_id,
             'block': self.start_block,
+            'button': 'exp_start',
         }
-        marker_event = None
-        marker_event = self._emit_marker('EXP_START', marker_payload)
-        log_payload = dict(marker_payload)
+        # enriched payload for consistent logging & markers (non-blocking)
+        payload = self._enrich_payload(base_payload, None)
+        marker_event = self._emit_marker('EXP_START', payload)
+        log_payload = dict(payload)
         if marker_event is not None:
             log_payload['marker'] = marker_event
         self.log_event(None, 'EXP_START', log_payload)
@@ -450,16 +452,19 @@ class TabletopRoot(FloatLayout):
             self._write_sync_report(reason=reason)
             self._sync_session_stopped = True
             return
-        marker_payload = {
+        base_payload = {
             'session': self.session_id,
             'reason': reason,
             'round': self.round,
+            'button': 'exp_stop',
         }
-        marker_event = self._emit_marker('EXP_STOP', marker_payload)
+        # enriched payload for consistent logging & markers (non-blocking)
+        payload = self._enrich_payload(base_payload, None)
+        marker_event = self._emit_marker('EXP_STOP', payload)
+        log_payload = dict(payload)
         if marker_event is not None:
-            marker_payload = dict(marker_payload)
-            marker_payload['marker'] = marker_event
-        self.log_event(None, 'EXP_STOP', marker_payload)
+            log_payload['marker'] = marker_event
+        self.log_event(None, 'EXP_STOP', log_payload)
         if self.eye_tracker_manager is not None:
             try:
                 self.eye_tracker_manager.stop_all()
@@ -968,14 +973,13 @@ class TabletopRoot(FloatLayout):
             self.record_action(who, 'Play gedrückt')
             if self.session_configured:
                 action = 'start_click' if self.phase == UXPhase.WAIT_BOTH_START else 'next_round_click'
-                marker_payload = {
-                    'actor': self._actor_label(who),
-                    'phase': getattr(self.phase, 'name', str(self.phase)),
-                    'round_idx': max(0, self.round - 1),
+                base_payload = {
                     'button': 'start' if self.phase == UXPhase.WAIT_BOTH_START else 'next_round',
                 }
-                marker_event = self._emit_marker('BUTTON_PRESS', marker_payload)
-                log_payload = dict(marker_payload)
+                # enriched payload for consistent logging & markers (non-blocking)
+                payload = self._enrich_payload(base_payload, who)
+                marker_event = self._emit_marker('BUTTON_PRESS', payload)
+                log_payload = dict(payload)
                 if marker_event is not None:
                     log_payload['marker'] = marker_event
                 self.log_event(who, action, log_payload)
@@ -1048,17 +1052,15 @@ class TabletopRoot(FloatLayout):
             if result.record_text:
                 self.record_action(who, result.record_text)
             if result.log_action:
-                log_payload = dict(result.log_payload or {})
-                marker_event = self._emit_marker(
-                    'TOUCH_CARD',
-                    {
-                        'actor': self._actor_label(who),
-                        'slot': which,
-                        'round_idx': max(0, self.round - 1),
-                    },
-                )
+                base_payload = dict(result.log_payload or {})
+                base_payload.setdefault('slot', which)
+                base_payload.setdefault('button', f'card_{which}')
+                # enriched payload for consistent logging & markers (non-blocking)
+                payload = self._enrich_payload(base_payload, who)
+                marker_event = self._emit_marker('TOUCH_CARD', payload)
+                log_payload = dict(payload)
                 if marker_event is not None:
-                    log_payload.setdefault('marker', marker_event)
+                    log_payload['marker'] = marker_event
                 self.log_event(who, result.log_action, log_payload)
             if result.next_phase:
                 Clock.schedule_once(lambda *_: self.goto(result.next_phase), 0.2)
@@ -1083,19 +1085,15 @@ class TabletopRoot(FloatLayout):
                     btn.set_live(False)
                     btn.disabled = True
             self.record_action(player, f'Signal gewählt: {self.describe_level(level)}')
-            if result.log_payload:
-                log_payload = dict(result.log_payload)
-                marker_event = self._emit_marker(
-                    'BUTTON_PRESS',
-                    {
-                        'actor': self._actor_label(player),
-                        'button': f'signal_{level}',
-                        'round_idx': max(0, self.round - 1),
-                    },
-                )
-                if marker_event is not None:
-                    log_payload.setdefault('marker', marker_event)
-                self.log_event(player, 'signal_choice', log_payload)
+            base_payload = dict(result.log_payload or {})
+            base_payload.setdefault('button', f'signal_{level}')
+            # enriched payload for consistent logging & markers (non-blocking)
+            payload = self._enrich_payload(base_payload, player)
+            marker_event = self._emit_marker('BUTTON_PRESS', payload)
+            log_payload = dict(payload)
+            if marker_event is not None:
+                log_payload['marker'] = marker_event
+            self.log_event(player, 'signal_choice', log_payload)
             self.update_user_displays()
             if result.next_phase:
                 Clock.schedule_once(lambda *_: self.goto(result.next_phase), 0.2)
@@ -1121,19 +1119,16 @@ class TabletopRoot(FloatLayout):
                     btn.set_live(False)
                     btn.disabled = True
             self.record_action(player, f'Entscheidung: {decision.upper()}')
-            if result.log_payload:
-                log_payload = dict(result.log_payload)
-                marker_event = self._emit_marker(
-                    'BUTTON_PRESS',
-                    {
-                        'actor': self._actor_label(player),
-                        'button': f'decision_{decision}',
-                        'round_idx': max(0, self.round - 1),
-                    },
-                )
-                if marker_event is not None:
-                    log_payload.setdefault('marker', marker_event)
-                self.log_event(player, 'call_choice', log_payload)
+            base_payload = dict(result.log_payload or {})
+            base_payload.setdefault('button', f'decision_{decision}')
+            base_payload.setdefault('decision', decision)
+            # enriched payload for consistent logging & markers (non-blocking)
+            payload = self._enrich_payload(base_payload, player)
+            marker_event = self._emit_marker('BUTTON_PRESS', payload)
+            log_payload = dict(payload)
+            if marker_event is not None:
+                log_payload['marker'] = marker_event
+            self.log_event(player, 'call_choice', log_payload)
             self.update_user_displays()
             if result.next_phase:
                 Clock.schedule_once(lambda *_: self.goto(result.next_phase), 0.2)
@@ -1252,7 +1247,10 @@ class TabletopRoot(FloatLayout):
                     self.score_state[winner_role] += POINTS_PER_WIN
                     self.outcome_score_applied = True
         if self.session_configured:
-            self.log_event(None, 'showdown', outcome or {})
+            base_payload = dict(outcome or {})
+            # enriched payload for consistent logging & markers (non-blocking)
+            payload = self._enrich_payload(base_payload, None)
+            self.log_event(None, 'showdown', payload)
         self.update_user_displays()
 
     def card_value_from_path(self, path: str):
@@ -1564,12 +1562,24 @@ class TabletopRoot(FloatLayout):
             return 'P2'
         return 'P1' if player == 1 else 'P2'
 
+    def _enrich_payload(self, base: Optional[Dict[str, Any]], player: Optional[int]) -> Dict[str, Any]:
+        """Inject shared metadata into marker/log payloads."""
+
+        return enrich_payload(
+            base,
+            player=player,
+            phase_obj=self.phase,
+            round_index=self.round,
+            actor_label_fn=self._actor_label,
+            player_roles=self.player_roles,
+        )
+
     def log_event(self, player: Optional[int], action: str, payload=None):
         if not self.logger or not self.session_configured:
             return None
-        payload = payload or {}
-        actor = self._actor_label(player)
-        round_idx = max(0, self.round - 1)
+        payload = self._enrich_payload(payload, player)
+        actor = payload.get('actor', self._actor_label(player))
+        round_idx = payload.get('round_idx', max(0, (self.round or 1) - 1))
         event = self.logger.log(
             round_idx,
             self.current_engine_phase(),
@@ -1737,7 +1747,7 @@ class TabletopRoot(FloatLayout):
     def log_round_start(self):
         if not self.session_configured:
             return
-        self.log_event(None, 'round_start', {
+        base_payload = {
             'round': self.round,
             'block': self.current_block_info['index'] if self.current_block_info else None,
             'round_in_block': self.round_in_block if self.current_block_info else None,
@@ -1746,7 +1756,10 @@ class TabletopRoot(FloatLayout):
             'judge': self.judge,
             'vp_roles': self.role_by_physical.copy(),
             'player_roles': self.player_roles.copy(),
-        })
+        }
+        # enriched payload for consistent logging & markers (non-blocking)
+        payload = self._enrich_payload(base_payload, None)
+        self.log_event(None, 'round_start', payload)
         self.pending_round_start_log = False
 
     def log_round_start_if_pending(self):

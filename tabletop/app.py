@@ -12,7 +12,7 @@ from contextlib import suppress
 from logging.handlers import QueueHandler, QueueListener
 from pathlib import Path
 from queue import Queue
-from typing import Any, Optional, Sequence, cast
+from typing import Any, Dict, Optional, Sequence, cast
 
 import logging
 
@@ -33,6 +33,7 @@ Window.multitouch_on_demand = True  # non-blocking: reduce touch sampling overhe
 
 from tabletop.data.config import ARUCO_OVERLAY_PATH, ROOT
 from tabletop.logging.round_csv import close_round_log, flush_round_log
+from tabletop.logging.payload import enrich_payload
 from tabletop.logging.bridge import EventBridge
 from tabletop.overlay.process import (
     OverlayProcess,
@@ -187,6 +188,33 @@ class TabletopApp(App):
             log.info("Configured Neon devices: %s", labels)
         else:
             log.info("Neon device manager initialised without configured devices")
+
+    def _root_enriched_payload(self, base: Dict[str, Any]) -> Dict[str, Any]:
+        """Populate system metadata for marker/log payloads via the root view."""
+
+        root = cast(Optional[TabletopRoot], self.root)
+        enrich_method = getattr(root, "_enrich_payload", None) if root is not None else None
+        if callable(enrich_method):
+            return enrich_method(base, None)
+
+        def _default_actor_label(_player: Optional[int]) -> str:
+            return "SYS"
+
+        actor_label_fn = getattr(root, "_actor_label", None) if root is not None else None
+        if not callable(actor_label_fn):
+            actor_label_fn = _default_actor_label
+        player_roles = dict(getattr(root, "player_roles", {}) or {}) if root is not None else {}
+        phase_obj = getattr(root, "phase", "APP") if root is not None else "APP"
+        round_index = getattr(root, "round", 1) if root is not None else 0
+        # enriched payload for consistent logging & markers (non-blocking)
+        return enrich_payload(
+            base,
+            player=None,
+            phase_obj=phase_obj,
+            round_index=round_index,
+            actor_label_fn=actor_label_fn,
+            player_roles=player_roles,
+        )
 
     def _load_neon_devices(self) -> list[NeonDevice]:
         """Read Neon device configuration from ``neon_devices.txt``."""
@@ -420,11 +448,14 @@ class TabletopApp(App):
             root = cast(Optional[TabletopRoot], self.root)
             codepoint = args[0] if args else ""
             key_name = self._format_key_name(key, codepoint)
-            payload = {
+            base_payload = {
                 "key": key_name,
                 "key_code": key,
                 "scancode": scancode,
+                "button": f"key_{key_name}",
             }
+            # enriched payload for consistent logging & markers (non-blocking)
+            payload = self._root_enriched_payload(base_payload)
             marker_event = None
             target_bridge = getattr(root, "marker_bridge", None)
             if target_bridge is None:
@@ -574,8 +605,11 @@ class TabletopApp(App):
     def _auto_start_recordings(self, session_id: str) -> None:
         logger = getattr(self, "logger", log)
         try:
+            base_payload = {"session": session_id, "button": "auto_exp_start"}
+            # enriched payload for consistent logging & markers (non-blocking)
+            start_payload = self._root_enriched_payload(base_payload)
             if hasattr(self, "marker_hub") and self.marker_hub:
-                self.marker_hub.emit("EXP_START", {"session": session_id})
+                self.marker_hub.emit("EXP_START", start_payload)
             if hasattr(self, "eye_mgr") and self.eye_mgr:
                 self.eye_mgr.start_all(session_id)
                 logger.info("Requested Neon start for session %s", session_id)
@@ -591,8 +625,11 @@ class TabletopApp(App):
 
         logger = getattr(self, "logger", log)
         try:
+            base_payload = {"button": "auto_exp_stop"}
+            # enriched payload for consistent logging & markers (non-blocking)
+            stop_payload = self._root_enriched_payload(base_payload)
             if hasattr(self, "marker_hub") and self.marker_hub:
-                self.marker_hub.emit("EXP_STOP", {})
+                self.marker_hub.emit("EXP_STOP", stop_payload)
             if hasattr(self, "eye_mgr") and self.eye_mgr:
                 self.eye_mgr.stop_all()
                 logger.info("Requested Neon stop for all devices")
