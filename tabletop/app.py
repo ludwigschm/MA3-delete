@@ -550,6 +550,13 @@ class TabletopApp(App):
 
         Clock.schedule_once(_enter_fullscreen, 0.0)
 
+        session_id = getattr(self, "_session_id", None) or time.strftime("sess_%Y%m%d_%H%M%S")
+        self._session_id = session_id
+        Clock.schedule_once(
+            lambda *_: self._auto_start_recordings(session_id),
+            0.1,
+        )
+
         if self._perf_logging:
             self._frame_samples.clear()
             self._frame_sampler = Clock.schedule_interval(
@@ -562,8 +569,33 @@ class TabletopApp(App):
                 self._monitor_queues, 1.0
             )
 
+    def _auto_start_recordings(self, session_id: str) -> None:
+        logger = getattr(self, "logger", log)
+        try:
+            if hasattr(self, "marker_hub") and self.marker_hub:
+                self.marker_hub.emit("EXP_START", {"session": session_id})
+            if hasattr(self, "eye_mgr") and self.eye_mgr:
+                self.eye_mgr.start_all(session_id)
+                logger.info("Requested Neon start for session %s", session_id)
+            else:
+                logger.warning(
+                    "EyeTrackerManager not available; cannot start recordings."
+                )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception("Auto start failed: %s", exc)
+
     def on_stop(self) -> None:  # pragma: no cover - framework callback
         root = cast(Optional[TabletopRoot], self.root)
+
+        logger = getattr(self, "logger", log)
+        try:
+            if hasattr(self, "marker_hub") and self.marker_hub:
+                self.marker_hub.emit("EXP_STOP", {})
+            if hasattr(self, "eye_mgr") and self.eye_mgr:
+                self.eye_mgr.stop_all()
+                logger.info("Requested Neon stop for all devices")
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception("Auto stop failed: %s", exc)
 
         for event in (self._frame_sampler, self._frame_log_event, self._queue_monitor_event):
             self._cancel_event(event)
