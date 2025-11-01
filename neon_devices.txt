@@ -1,9 +1,0 @@
-# Neon Geräte-Konfiguration
-
-VP1_ID=
-VP1_IP=192.168.137.121
-VP1_PORT=8080
-
-VP2_ID=
-VP2_IP=
-VP2_PORT=8080
