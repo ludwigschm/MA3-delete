@@ -29,6 +29,8 @@ from kivy.clock import Clock
 from kivy.core.window import Window
 from kivy.lang import Builder
 
+Window.multitouch_on_demand = True  # non-blocking: reduce touch sampling overhead
+
 from tabletop.data.config import ARUCO_OVERLAY_PATH, ROOT
 from tabletop.logging.round_csv import close_round_log, flush_round_log
 from tabletop.logging.bridge import EventBridge
