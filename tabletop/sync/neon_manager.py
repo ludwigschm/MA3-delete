@@ -19,7 +19,7 @@ from queue import Queue, Full, Empty
 import threading
 from typing import Any, Iterable, Optional
 import time
-import requests
+import requests  # NEW
 
 log = logging.getLogger(__name__)
 
@@ -68,12 +68,14 @@ class EyeTrackerManager:
 
         self._active_session = session_id
         payload = {"session_id": session_id}
+        log.info("Enqueue start_all for all Neon devices (session=%s)", session_id)
         self._broadcast_command("start", payload)
 
     def stop_all(self) -> None:
         """Stop recording on all configured devices asynchronously."""
 
         payload = {"session_id": self._active_session}
+        log.info("Enqueue stop_all for all Neon devices")
         self._broadcast_command("stop", payload)
         self._active_session = None
 
@@ -83,6 +85,7 @@ class EyeTrackerManager:
         combined = {"label": label, "payload": payload}
         if self._active_session:
             combined["session_id"] = self._active_session
+        log.info("Enqueue annotate for all Neon devices: %s", label)
         self._broadcast_command("annotate", combined)
 
     def shutdown(self) -> None:
@@ -117,6 +120,7 @@ class EyeTrackerManager:
                 command, device, payload = self._queue.get(timeout=0.5)
             except Empty:
                 continue
+            log.info("Neon worker received command: %s", command)
             if command is self._sentinel:
                 self._queue.task_done()
                 break
@@ -132,51 +136,78 @@ class EyeTrackerManager:
 
     # ------------------------------------------------------------------
     # Remote communication (placeholder)
-    def _dispatch_remote(self, command: str, device: NeonDevice, payload: dict[str, Any]) -> bool:
+    def _dispatch_remote(
+        self, command: str, device: NeonDevice, payload: dict[str, Any]
+    ) -> bool:
         """
-        Liefert den Befehl per HTTP an das Neon-Companion-API.
-        Gibt True zurück, wenn der Request erfolgreich war (HTTP 2xx).
+        Send command to Neon Companion HTTP API (default port 8080).
+        Returns True on HTTP 2xx, otherwise False.
         """
         host = device.host
-        port = device.port or 8080  # Default auf 8080, falls 0 in Config
+        port = device.port or 8080
         base = f"http://{host}:{port}/api"
 
         try:
             if command == "start":
-                # optional: zusätzliche Felder wie template, subject, etc. mitgeben
                 url = f"{base}/recording:start"
-                r = requests.post(url, json={"session_id": payload.get("session_id", "")}, timeout=2.0)
+                r = requests.post(
+                    url,
+                    json={"session_id": payload.get("session_id", "")},
+                    timeout=2.0,
+                )
+                log.info(
+                    "Neon start → %s (%s): %s %s",
+                    device.label or device.id,
+                    host,
+                    r.status_code,
+                    r.text[:200],
+                )
                 r.raise_for_status()
                 return True
 
             elif command == "stop":
                 url = f"{base}/recording:stop_and_save"
                 r = requests.post(url, json={}, timeout=2.0)
+                log.info(
+                    "Neon stop  → %s (%s): %s %s",
+                    device.label or device.id,
+                    host,
+                    r.status_code,
+                    r.text[:200],
+                )
                 r.raise_for_status()
                 return True
 
             elif command == "annotate":
-                # Events/Annotations: /api/event
-                # name/label ist Pflicht; zusätzliche Daten packen wir in "properties"
                 label = str(payload.get("label", "event"))
                 props = payload.get("payload", {})
-                # Du kannst auch ein präzises Epoch-ns angeben; sonst timestamped the device on reception
                 body = {
                     "name": label,
                     "properties": props,
-                    # "timestamp_ns": time.time_ns(),  # optional: eigene Zeitmarke
+                    # Optional: "timestamp_ns": time.time_ns(),
                 }
                 url = f"{base}/event"
                 r = requests.post(url, json=body, timeout=2.0)
+                log.info(
+                    "Neon event → %s (%s): %s %s",
+                    device.label or device.id,
+                    host,
+                    r.status_code,
+                    r.text[:200],
+                )
                 r.raise_for_status()
                 return True
 
-            else:
-                # Unbekannter Command → Fallback
-                return False
+            return False
 
         except requests.RequestException as e:
-            log.warning("Neon HTTP %s on %s (%s) failed: %s", command, device.label or device.id, host, e)
+            log.error(
+                "Neon HTTP %s FAILED on %s (%s): %s",
+                command,
+                device.label or device.id,
+                host,
+                e,
+            )
             return False
 
 
