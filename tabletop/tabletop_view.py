@@ -29,6 +29,7 @@ from tabletop.logging.round_csv import (
     round_log_action_label,
     write_round_log,
 )
+from tabletop.logging.bridge import EventBridge
 from tabletop.overlay.fixation import (
     generate_fixation_tone,
     play_fixation_tone as overlay_play_fixation_tone,
@@ -50,6 +51,9 @@ from tabletop.ui.assets import (
     resolve_background_texture,
 )
 from tabletop.ui.widgets import CardWidget, IconButton, RotatableLabel
+from tabletop.sync.markers import MarkerHub
+from tabletop.sync.neon_manager import EyeTrackerManager
+from tabletop.sync.estimator import write_sync_report
 
 log = logging.getLogger(__name__)
 
@@ -169,6 +173,14 @@ class TabletopRoot(FloatLayout):
         self.round_log_buffer = []
         self.overlay_display_index = 0
 
+        self.marker_hub: Optional[MarkerHub] = None
+        self.marker_bridge: Optional[EventBridge] = None
+        self.eye_tracker_manager: Optional[EyeTrackerManager] = None
+        self._sync_report_writer = write_sync_report
+        self._sync_report_path: Optional[Path] = None
+        self._sync_session_started = False
+        self._sync_session_stopped = False
+
         self._low_latency_disabled = is_low_latency_disabled()
         self.perf_logging = (
             bool(perf_logging) or is_perf_logging_enabled()
@@ -200,6 +212,25 @@ class TabletopRoot(FloatLayout):
         if item in self._STATE_FIELDS and 'controller' in self.__dict__:
             return getattr(self.controller.state, item)
         raise AttributeError(item)
+
+    def configure_sync_services(
+        self,
+        *,
+        marker_hub: Optional[MarkerHub] = None,
+        marker_bridge: Optional[EventBridge] = None,
+        eye_tracker_manager: Optional[EyeTrackerManager] = None,
+        report_writer: Optional[Callable[[str, dict[str, Any]], None]] = None,
+    ) -> None:
+        """Inject synchronisation helpers provided by the application."""
+
+        if marker_hub is not None:
+            self.marker_hub = marker_hub
+        if marker_bridge is not None:
+            self.marker_bridge = marker_bridge
+        if eye_tracker_manager is not None:
+            self.eye_tracker_manager = eye_tracker_manager
+        if report_writer is not None:
+            self._sync_report_writer = report_writer
 
     # ------------------------------------------------------------------
     # Session helpers
@@ -254,6 +285,7 @@ class TabletopRoot(FloatLayout):
         db_path = self.log_dir / f'events_{safe_session_id}.sqlite3'
         self.session_storage_id = safe_session_id
         self.logger = self.events_factory(self.session_id, str(db_path))
+        self._sync_report_path = self.log_dir / f'sync_report_session_{safe_session_id}.json'
         init_round_log(self)
         self.update_role_assignments()
 
@@ -267,7 +299,90 @@ class TabletopRoot(FloatLayout):
                 'start_block': self.start_block,
             },
         )
+        self._start_sync_session()
         self._apply_session_options_and_start()
+
+    def _start_sync_session(self) -> None:
+        if self._sync_session_started or not self.session_id:
+            return
+        session_id = self.session_id
+        if self.eye_tracker_manager is not None:
+            try:
+                self.eye_tracker_manager.start_all(session_id)
+            except Exception:  # pragma: no cover - defensive
+                log.exception("Starting Neon devices failed")
+        marker_payload = {
+            'session': session_id,
+            'block': self.start_block,
+        }
+        marker_event = None
+        if self.marker_hub is not None:
+            marker_event = self.marker_hub.emit('EXP_START', marker_payload)
+        log_payload = dict(marker_payload)
+        if marker_event is not None:
+            log_payload['marker'] = marker_event
+        self.log_event(None, 'EXP_START', log_payload)
+        self._sync_session_started = True
+
+    def _stop_sync_session(self, *, reason: str = 'finished', force: bool = False) -> None:
+        if self._sync_session_stopped:
+            return
+        if not self._sync_session_started:
+            if not force:
+                return
+            if self.eye_tracker_manager is not None:
+                try:
+                    self.eye_tracker_manager.stop_all()
+                except Exception:  # pragma: no cover - defensive
+                    log.exception("Stopping Neon devices failed")
+            self._write_sync_report(reason=reason)
+            self._sync_session_stopped = True
+            return
+        marker_payload = {
+            'session': self.session_id,
+            'reason': reason,
+            'round': self.round,
+        }
+        marker_event = None
+        if self.marker_hub is not None:
+            marker_event = self.marker_hub.emit('EXP_STOP', marker_payload)
+        if marker_event is not None:
+            marker_payload = dict(marker_payload)
+            marker_payload['marker'] = marker_event
+        self.log_event(None, 'EXP_STOP', marker_payload)
+        if self.eye_tracker_manager is not None:
+            try:
+                self.eye_tracker_manager.stop_all()
+            except Exception:  # pragma: no cover - defensive
+                log.exception("Stopping Neon devices failed")
+        self._write_sync_report(reason=reason)
+        self._sync_session_stopped = True
+
+    def _write_sync_report(self, *, reason: str) -> None:
+        if self._sync_report_writer is None or self._sync_report_path is None:
+            return
+        counts = self.marker_hub.counts() if self.marker_hub is not None else {}
+        touch_count = (
+            counts.get('TOUCH', 0)
+            + counts.get('BUTTON_PRESS', 0)
+            + counts.get('TOUCH_CARD', 0)
+        )
+        summary = {
+            'session_id': self.session_id,
+            'reason': reason,
+            'block_start': self.start_block,
+            'marker_counts': counts,
+            'fix_on': counts.get('FIX_ON', 0),
+            'fix_off': counts.get('FIX_OFF', 0),
+            'key_markers': counts.get('KEY_UP', 0),
+            'touch_markers': touch_count,
+            'offset_ms_estimate': None,
+            'jitter_ms_estimate': None,
+        }
+        try:
+            self._sync_report_writer(str(self._sync_report_path), summary)
+        except Exception:  # pragma: no cover - defensive
+            log.exception("Failed to write sync report")
 
     def _configure_session_from_cli(self, *_args: Any) -> None:
         if self.session_configured:
@@ -734,7 +849,19 @@ class TabletopRoot(FloatLayout):
         self.record_action(who, 'Play gedrückt')
         if self.session_configured:
             action = 'start_click' if self.phase == UXPhase.WAIT_BOTH_START else 'next_round_click'
-            self.log_event(who, action)
+            marker_payload = {
+                'actor': self._actor_label(who),
+                'phase': getattr(self.phase, 'name', str(self.phase)),
+                'round_idx': max(0, self.round - 1),
+                'button': 'start' if self.phase == UXPhase.WAIT_BOTH_START else 'next_round',
+            }
+            marker_event = None
+            if self.marker_bridge is not None:
+                marker_event = self.marker_bridge.enqueue('BUTTON_PRESS', marker_payload)
+            log_payload = dict(marker_payload)
+            if marker_event is not None:
+                log_payload['marker'] = marker_event
+            self.log_event(who, action, log_payload)
         if self.p1_pressed and self.p2_pressed:
             # in nächste Phase
             self.p1_pressed = False
@@ -786,7 +913,20 @@ class TabletopRoot(FloatLayout):
         if result.record_text:
             self.record_action(who, result.record_text)
         if result.log_action:
-            self.log_event(who, result.log_action, result.log_payload or {})
+            log_payload = dict(result.log_payload or {})
+            marker_event = None
+            if self.marker_bridge is not None:
+                marker_event = self.marker_bridge.enqueue(
+                    'TOUCH_CARD',
+                    {
+                        'actor': self._actor_label(who),
+                        'slot': which,
+                        'round_idx': max(0, self.round - 1),
+                    },
+                )
+            if marker_event is not None:
+                log_payload.setdefault('marker', marker_event)
+            self.log_event(who, result.log_action, log_payload)
         if result.next_phase:
             Clock.schedule_once(lambda *_: self.goto(result.next_phase), 0.2)
 
@@ -805,7 +945,20 @@ class TabletopRoot(FloatLayout):
                 btn.disabled = True
         self.record_action(player, f'Signal gewählt: {self.describe_level(level)}')
         if result.log_payload:
-            self.log_event(player, 'signal_choice', result.log_payload)
+            log_payload = dict(result.log_payload)
+            marker_event = None
+            if self.marker_bridge is not None:
+                marker_event = self.marker_bridge.enqueue(
+                    'BUTTON_PRESS',
+                    {
+                        'actor': self._actor_label(player),
+                        'button': f'signal_{level}',
+                        'round_idx': max(0, self.round - 1),
+                    },
+                )
+            if marker_event is not None:
+                log_payload.setdefault('marker', marker_event)
+            self.log_event(player, 'signal_choice', log_payload)
         self.update_user_displays()
         if result.next_phase:
             Clock.schedule_once(lambda *_: self.goto(result.next_phase), 0.2)
@@ -826,7 +979,20 @@ class TabletopRoot(FloatLayout):
                 btn.disabled = True
         self.record_action(player, f'Entscheidung: {decision.upper()}')
         if result.log_payload:
-            self.log_event(player, 'call_choice', result.log_payload)
+            log_payload = dict(result.log_payload)
+            marker_event = None
+            if self.marker_bridge is not None:
+                marker_event = self.marker_bridge.enqueue(
+                    'BUTTON_PRESS',
+                    {
+                        'actor': self._actor_label(player),
+                        'button': f'decision_{decision}',
+                        'round_idx': max(0, self.round - 1),
+                    },
+                )
+            if marker_event is not None:
+                log_payload.setdefault('marker', marker_event)
+            self.log_event(player, 'call_choice', log_payload)
         self.update_user_displays()
         if result.next_phase:
             Clock.schedule_once(lambda *_: self.goto(result.next_phase), 0.2)
@@ -848,6 +1014,7 @@ class TabletopRoot(FloatLayout):
             self.pause_message = message
             self.update_pause_overlay()
             self.update_user_displays()
+            self._stop_sync_session(reason='completed')
             return
         if result.in_block_pause:
             self.in_block_pause = True
@@ -1244,22 +1411,23 @@ class TabletopRoot(FloatLayout):
     def current_engine_phase(self):
         return to_engine_phase(self.phase)
 
-    def log_event(self, player: int, action: str, payload=None):
-        if not self.logger or not self.session_configured:
-            return
-        payload = payload or {}
+    def _actor_label(self, player: Optional[int]) -> str:
         if player is None:
-            actor = 'SYS'
-        else:
-            role = self.player_roles.get(player)
-            if role == 1:
-                actor = 'P1'
-            elif role == 2:
-                actor = 'P2'
-            else:
-                actor = 'P1' if player == 1 else 'P2'
+            return 'SYS'
+        role = self.player_roles.get(player)
+        if role == 1:
+            return 'P1'
+        if role == 2:
+            return 'P2'
+        return 'P1' if player == 1 else 'P2'
+
+    def log_event(self, player: Optional[int], action: str, payload=None):
+        if not self.logger or not self.session_configured:
+            return None
+        payload = payload or {}
+        actor = self._actor_label(player)
         round_idx = max(0, self.round - 1)
-        self.logger.log(
+        event = self.logger.log(
             round_idx,
             self.current_engine_phase(),
             actor,
@@ -1267,6 +1435,7 @@ class TabletopRoot(FloatLayout):
             payload
         )
         write_round_log(self, actor, action, payload, player)
+        return event
 
     def prompt_session_number(self):
         if self.session_popup:
@@ -1440,6 +1609,22 @@ class TabletopRoot(FloatLayout):
     def log_round_start_if_pending(self):
         if self.pending_round_start_log:
             self.log_round_start()
+
+    def shutdown_sync_services(self) -> None:
+        try:
+            self._stop_sync_session(reason='app_shutdown', force=True)
+        except Exception:  # pragma: no cover - defensive
+            log.debug("stop_sync_session failed during shutdown", exc_info=True)
+        if self.marker_hub is not None:
+            try:
+                self.marker_hub.shutdown()
+            except Exception:  # pragma: no cover - defensive
+                log.debug("Marker hub shutdown raised", exc_info=True)
+        if self.eye_tracker_manager is not None:
+            try:
+                self.eye_tracker_manager.shutdown()
+            except Exception:  # pragma: no cover - defensive
+                log.debug("Eye tracker manager shutdown raised", exc_info=True)
 
     def record_action(self, player:int, text:str):
         self.status_lines[player].append(text)
