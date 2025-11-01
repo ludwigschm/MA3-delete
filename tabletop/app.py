@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import math
 import time
@@ -28,8 +29,9 @@ from kivy.clock import Clock
 from kivy.core.window import Window
 from kivy.lang import Builder
 
-from tabletop.data.config import ARUCO_OVERLAY_PATH
+from tabletop.data.config import ARUCO_OVERLAY_PATH, ROOT
 from tabletop.logging.round_csv import close_round_log, flush_round_log
+from tabletop.logging.bridge import EventBridge
 from tabletop.overlay.process import (
     OverlayProcess,
     start_overlay,
@@ -40,6 +42,9 @@ from tabletop.utils.runtime import (
     is_low_latency_disabled,
     is_perf_logging_enabled,
 )
+from tabletop.sync.markers import MarkerHub
+from tabletop.sync.neon_manager import EyeTrackerManager, NeonDevice
+from tabletop.sync.estimator import write_sync_report
 
 log = logging.getLogger(__name__)
 
@@ -82,7 +87,12 @@ class TabletopApp(App):
         self._frame_log_event = None
         self._queue_monitor_event = None
         self._last_queue_warning = 0.0
+        self.eye_mgr: Optional[EyeTrackerManager] = None
+        self.marker_hub: Optional[MarkerHub] = None
+        self.marker_bridge: Optional[EventBridge] = None
+        self._neon_devices: list[NeonDevice] = []
         super().__init__(**kwargs)
+        self._setup_sync_services()
 
     @staticmethod
     def _describe_window_screens() -> list[dict[str, int]]:
@@ -157,6 +167,54 @@ class TabletopApp(App):
                 app.quit()
 
         return screens
+
+    def _setup_sync_services(self) -> None:
+        """Initialise marker and eye-tracking infrastructure."""
+
+        try:
+            devices = self._load_neon_devices()
+        except Exception:  # pragma: no cover - defensive
+            log.exception("Failed to load Neon device configuration")
+            devices = []
+        self._neon_devices = devices
+        self.eye_mgr = EyeTrackerManager(devices)
+        self.marker_hub = MarkerHub(eye_tracker=self.eye_mgr)
+        self.marker_bridge = EventBridge(self.marker_hub)
+        if devices:
+            labels = ", ".join(f"{dev.label or dev.id}" for dev in devices)
+            log.info("Configured Neon devices: %s", labels)
+        else:
+            log.info("Neon device manager initialised without configured devices")
+
+    def _load_neon_devices(self) -> list[NeonDevice]:
+        """Read Neon device configuration from ``neon_devices.txt``."""
+
+        config_path = ROOT / "neon_devices.txt"
+        if not config_path.exists():
+            log.info("No Neon device configuration found at %s", config_path)
+            return []
+        try:
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            log.exception("Invalid JSON in neon_devices.txt")
+            return []
+        devices: list[NeonDevice] = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                log.warning("Skipping malformed Neon config entry: %r", entry)
+                continue
+            try:
+                device = NeonDevice(
+                    id=str(entry["id"]),
+                    host=str(entry["host"]),
+                    port=int(entry.get("port", 0) or 0),
+                    label=str(entry.get("label", "")),
+                )
+            except KeyError as exc:
+                log.warning("Missing field %s in neon_devices.txt entry: %r", exc, entry)
+                continue
+            devices.append(device)
+        return devices
 
     @staticmethod
     def _clamp_display_index(
@@ -299,6 +357,15 @@ class TabletopApp(App):
             perf_logging=self._perf_logging,
         )
 
+        configure_sync = getattr(root, "configure_sync_services", None)
+        if callable(configure_sync):
+            configure_sync(
+                marker_hub=self.marker_hub,
+                marker_bridge=self.marker_bridge,
+                eye_tracker_manager=self.eye_mgr,
+                report_writer=write_sync_report,
+            )
+
         # ESC binding is scheduled in ``on_start`` once the window exists.
         return root
 
@@ -348,6 +415,27 @@ class TabletopApp(App):
             scancode: int,
             *args: Any,
         ) -> bool:
+            root = cast(Optional[TabletopRoot], self.root)
+            codepoint = args[0] if args else ""
+            key_name = self._format_key_name(key, codepoint)
+            payload = {
+                "key": key_name,
+                "key_code": key,
+                "scancode": scancode,
+            }
+            marker_event = None
+            target_bridge = getattr(root, "marker_bridge", None)
+            if target_bridge is None:
+                target_bridge = self.marker_bridge
+            if target_bridge is not None:
+                marker_event = target_bridge.enqueue("KEY_UP", payload)
+            log_payload = dict(payload)
+            if marker_event is not None:
+                log_payload["marker"] = marker_event
+            if root is not None and getattr(root, "session_configured", False):
+                log_event = getattr(root, "log_event", None)
+                if callable(log_event):
+                    log_event(None, "KEY_UP", log_payload)
             return False
 
         self._key_up_handler = _on_key_up

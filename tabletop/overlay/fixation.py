@@ -101,6 +101,16 @@ def run_fixation_sequence(
 
     image.opacity = 1
     _set_image_source(image, live_image, fallback="cross")
+    round_idx = max(0, getattr(controller, "round", 1) - 1)
+    marker_event = None
+    marker_hub = getattr(controller, "marker_hub", None)
+    if marker_hub is not None:
+        marker_event = marker_hub.emit("FIX_ON", {"round_idx": round_idx})
+    if getattr(controller, "log_event", None):
+        payload = {"round_idx": round_idx}
+        if marker_event is not None:
+            payload["marker"] = marker_event
+        controller.log_event(None, "FIX_ON", payload)
 
     def finish(_dt: float) -> None:
         if getattr(overlay, "parent", None) is not None:
@@ -108,6 +118,17 @@ def run_fixation_sequence(
         overlay.opacity = 0
         overlay.disabled = True
         _remove_cross_overlay(image)
+        marker_off_event = None
+        marker_hub_finish = getattr(controller, "marker_hub", None)
+        if marker_hub_finish is not None:
+            marker_off_event = marker_hub_finish.emit(
+                "FIX_OFF", {"round_idx": round_idx}
+            )
+        if getattr(controller, "log_event", None):
+            payload = {"round_idx": round_idx}
+            if marker_off_event is not None:
+                payload["marker"] = marker_off_event
+            controller.log_event(None, "FIX_OFF", payload)
         controller.fixation_running = False
         if hasattr(controller, "fixation_required"):
             controller.fixation_required = False
