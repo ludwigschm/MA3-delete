@@ -7,6 +7,8 @@ import importlib.util
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from tabletop.logging.payload import enrich_payload
+
 import numpy as np
 import sounddevice as sd
 import threading
@@ -89,11 +91,31 @@ def run_fixation_sequence(
             on_complete()
         return
 
+    def _enriched(extra: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        enrich_method = getattr(controller, "_enrich_payload", None)
+        if callable(enrich_method):
+            return enrich_method(extra, None)
+        actor_label = getattr(controller, "_actor_label", lambda _player: "SYS")
+        player_roles = dict(getattr(controller, "player_roles", {}) or {})
+        phase_obj = getattr(controller, "phase", None)
+        round_index = getattr(controller, "round", 1)
+        return enrich_payload(
+            extra,
+            player=None,
+            phase_obj=phase_obj,
+            round_index=round_index,
+            actor_label_fn=actor_label,
+            player_roles=player_roles,
+        )
+
     def _log_fixation_event(kind: str) -> None:
         log_event = getattr(controller, "log_event", None)
         if not callable(log_event):
             return
-        log_event(None, kind, None)
+        base_payload: dict[str, Any] = {"button": kind}
+        # enriched payload for consistent logging & markers (non-blocking)
+        payload = _enriched(base_payload)
+        log_event(None, kind, payload)
 
     controller.fixation_running = True
     controller.pending_fixation_callback = on_complete
@@ -113,16 +135,19 @@ def run_fixation_sequence(
 
     image.opacity = 1
     _set_image_source(image, live_image, fallback="cross")
-    round_idx = max(0, getattr(controller, "round", 1) - 1)
     marker_event = None
     marker_hub = getattr(controller, "marker_hub", None)
+    base_on_payload: dict[str, Any] = {"button": "fixation_on"}
+    # enriched payload for consistent logging & markers (non-blocking)
+    enriched_on = _enriched(base_on_payload)
     if marker_hub is not None:
-        marker_event = marker_hub.emit("FIX_ON", {"round_idx": round_idx})
-    if getattr(controller, "log_event", None):
-        payload = {"round_idx": round_idx}
+        marker_event = marker_hub.emit("FIX_ON", enriched_on)
+    log_event_callable = getattr(controller, "log_event", None)
+    if callable(log_event_callable):
+        log_payload = dict(enriched_on)
         if marker_event is not None:
-            payload["marker"] = marker_event
-        controller.log_event(None, "FIX_ON", payload)
+            log_payload["marker"] = marker_event
+        log_event_callable(None, "FIX_ON", log_payload)
 
     def finish(_dt: float) -> None:
         if getattr(overlay, "parent", None) is not None:
@@ -132,15 +157,17 @@ def run_fixation_sequence(
         _remove_cross_overlay(image)
         marker_off_event = None
         marker_hub_finish = getattr(controller, "marker_hub", None)
+        base_off_payload: dict[str, Any] = {"button": "fixation_off"}
+        # enriched payload for consistent logging & markers (non-blocking)
+        enriched_off = _enriched(base_off_payload)
         if marker_hub_finish is not None:
-            marker_off_event = marker_hub_finish.emit(
-                "FIX_OFF", {"round_idx": round_idx}
-            )
-        if getattr(controller, "log_event", None):
-            payload = {"round_idx": round_idx}
+            marker_off_event = marker_hub_finish.emit("FIX_OFF", enriched_off)
+        log_event_callable = getattr(controller, "log_event", None)
+        if callable(log_event_callable):
+            payload = dict(enriched_off)
             if marker_off_event is not None:
                 payload["marker"] = marker_off_event
-            controller.log_event(None, "FIX_OFF", payload)
+            log_event_callable(None, "FIX_OFF", payload)
         controller.fixation_running = False
         if hasattr(controller, "fixation_required"):
             controller.fixation_required = False
