@@ -4,6 +4,7 @@ import csv
 import itertools
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -44,6 +45,8 @@ from tabletop.utils.runtime import (
     is_low_latency_disabled,
     is_perf_logging_enabled,
 )
+from tabletop.utils.async_worker import enqueue_io_task, io_queue_load
+from tabletop.utils.input_timing import Debouncer
 from tabletop.ui.assets import (
     ASSETS,
     FIX_LIVE_IMAGE,
@@ -188,6 +191,9 @@ class TabletopRoot(FloatLayout):
         self._single_block_mode = single_block_mode
         self._initial_session = session
         self._initial_block = block
+        self._input_debouncer = Debouncer()
+        self._last_io_queue_log = 0.0
+        self._session_setup_in_progress = False
 
         # --- UI Elemente initialisieren
         self._configure_widgets()
@@ -233,6 +239,88 @@ class TabletopRoot(FloatLayout):
             self._sync_report_writer = report_writer
 
     # ------------------------------------------------------------------
+    def _handler_timer_start(self) -> Optional[int]:
+        if not self.perf_logging:
+            return None
+        return time.perf_counter_ns()
+
+    def _handler_timer_end(self, label: str, started_ns: Optional[int]) -> None:
+        if not self.perf_logging or started_ns is None:
+            return
+        duration_ms = (time.perf_counter_ns() - started_ns) / 1_000_000.0
+        if duration_ms >= 1.0:
+            log.debug("handler.%s took %.2f ms", label, duration_ms)
+
+    def _log_async_queue_load(self, context: str) -> None:
+        if not self.perf_logging:
+            return
+        load = io_queue_load()
+        if load <= 0.0:
+            return
+        now = time.monotonic()
+        if load >= 0.8 and now - self._last_io_queue_log >= 1.0:
+            log.debug("async_io_queue at %.0f%% (%s)", load * 100.0, context)
+            self._last_io_queue_log = now
+
+    def _schedule_io_task(
+        self,
+        func: Callable[[], Any],
+        *,
+        description: str = "",
+        on_complete: Optional[Callable[[Any], None]] = None,
+        on_error: Optional[Callable[[BaseException], None]] = None,
+    ) -> None:
+        """Run ``func`` in the background and dispatch callbacks on the UI thread."""
+
+        cb: Optional[Callable[[Any, Optional[BaseException]], None]] = None
+        if on_complete is not None or on_error is not None:
+
+            def _cb(result: Any, error: Optional[BaseException]) -> None:
+                if error is not None:
+                    if on_error is not None:
+                        on_error(error)
+                    else:
+                        log.exception(
+                            "Async task %s failed", description or getattr(func, "__name__", "io_task"),
+                            exc_info=error,
+                        )
+                    return
+                if on_complete is not None:
+                    on_complete(result)
+
+            cb = _cb
+
+        enqueued = enqueue_io_task(func, on_complete=cb)
+        if enqueued:
+            self._log_async_queue_load(description or getattr(func, "__name__", "io_task"))
+            return
+
+        # Queue full → run synchronously without blocking the UI thread with waits.
+        try:
+            result = func()
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            if on_error is not None:
+                on_error(exc)
+            else:
+                log.exception(
+                    "Inline async task %s failed",
+                    description or getattr(func, "__name__", "io_task"),
+                    exc_info=exc,
+                )
+            return
+        if on_complete is not None:
+            on_complete(result)
+
+    def _emit_marker(self, kind: str, payload: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """Emit a marker without blocking the UI thread."""
+
+        if self.marker_bridge is not None:
+            return self.marker_bridge.enqueue(kind, payload)
+        if self.marker_hub is not None:
+            return self.marker_hub.emit(kind, payload)
+        return None
+
+    # ------------------------------------------------------------------
     # Session helpers
     def _available_block_count(self) -> int:
         blocks = self._blocks or []
@@ -264,6 +352,10 @@ class TabletopRoot(FloatLayout):
     ) -> None:
         if not session_label:
             return
+        if self._session_setup_in_progress:
+            return
+
+        self._session_setup_in_progress = True
 
         self.session_id = session_label
         digits = ''.join(ch for ch in session_label if ch.isdigit())
@@ -280,27 +372,48 @@ class TabletopRoot(FloatLayout):
             for ch in self.session_id
         ) or 'session'
 
-        self.session_configured = True
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        db_path = self.log_dir / f'events_{safe_session_id}.sqlite3'
-        self.session_storage_id = safe_session_id
-        self.logger = self.events_factory(self.session_id, str(db_path))
-        self._sync_report_path = self.log_dir / f'sync_report_session_{safe_session_id}.json'
-        init_round_log(self)
-        self.update_role_assignments()
+        log_dir = self.log_dir
+        session_id = self.session_id
+        events_factory = self.events_factory
 
-        self.log_event(
-            None,
-            'session_start',
-            {
-                'session_number': self.session_number,
-                'session_id': self.session_id,
-                'aruco_enabled': self.aruco_enabled,
-                'start_block': self.start_block,
-            },
+        def _prepare() -> Events:
+            # non-blocking: moved session setup I/O to worker
+            log_dir.mkdir(parents=True, exist_ok=True)
+            db_path = log_dir / f'events_{safe_session_id}.sqlite3'
+            return events_factory(session_id, str(db_path))
+
+        def _on_ready(events: Events) -> None:
+            self.session_storage_id = safe_session_id
+            self.logger = events
+            self._sync_report_path = log_dir / f'sync_report_session_{safe_session_id}.json'
+            self.session_configured = True
+            init_round_log(self)
+            self.update_role_assignments()
+
+            self.log_event(
+                None,
+                'session_start',
+                {
+                    'session_number': self.session_number,
+                    'session_id': self.session_id,
+                    'aruco_enabled': self.aruco_enabled,
+                    'start_block': self.start_block,
+                },
+            )
+            self._start_sync_session()
+            self._apply_session_options_and_start()
+            self._session_setup_in_progress = False
+
+        def _on_error(exc: BaseException) -> None:
+            self._session_setup_in_progress = False
+            log.exception("Session setup failed", exc_info=exc)
+
+        self._schedule_io_task(
+            _prepare,
+            description='session_setup',
+            on_complete=_on_ready,
+            on_error=_on_error,
         )
-        self._start_sync_session()
-        self._apply_session_options_and_start()
 
     def _start_sync_session(self) -> None:
         if self._sync_session_started or not self.session_id:
@@ -316,8 +429,7 @@ class TabletopRoot(FloatLayout):
             'block': self.start_block,
         }
         marker_event = None
-        if self.marker_hub is not None:
-            marker_event = self.marker_hub.emit('EXP_START', marker_payload)
+        marker_event = self._emit_marker('EXP_START', marker_payload)
         log_payload = dict(marker_payload)
         if marker_event is not None:
             log_payload['marker'] = marker_event
@@ -343,9 +455,7 @@ class TabletopRoot(FloatLayout):
             'reason': reason,
             'round': self.round,
         }
-        marker_event = None
-        if self.marker_hub is not None:
-            marker_event = self.marker_hub.emit('EXP_STOP', marker_payload)
+        marker_event = self._emit_marker('EXP_STOP', marker_payload)
         if marker_event is not None:
             marker_payload = dict(marker_payload)
             marker_payload['marker'] = marker_event
@@ -355,7 +465,10 @@ class TabletopRoot(FloatLayout):
                 self.eye_tracker_manager.stop_all()
             except Exception:  # pragma: no cover - defensive
                 log.exception("Stopping Neon devices failed")
-        self._write_sync_report(reason=reason)
+        self._schedule_io_task(
+            lambda: self._write_sync_report(reason=reason),
+            description='sync_report',
+        )
         self._sync_session_stopped = True
 
     def _write_sync_report(self, *, reason: str) -> None:
@@ -839,64 +952,68 @@ class TabletopRoot(FloatLayout):
             proceed()
 
     def start_pressed(self, who:int):
-        if self.session_finished and not self.in_block_pause:
+        if not self._input_debouncer.allow(f'start:{who}'):
             return
-        allowed_phase = self.phase in (UXPhase.WAIT_BOTH_START, UXPhase.SHOWDOWN)
-        if not allowed_phase and not self.in_block_pause:
-            return
-        if who == 1:
-            self.p1_pressed = True
-        else:
-            self.p2_pressed = True
-        self.record_action(who, 'Play gedrückt')
-        if self.session_configured:
-            action = 'start_click' if self.phase == UXPhase.WAIT_BOTH_START else 'next_round_click'
-            marker_payload = {
-                'actor': self._actor_label(who),
-                'phase': getattr(self.phase, 'name', str(self.phase)),
-                'round_idx': max(0, self.round - 1),
-                'button': 'start' if self.phase == UXPhase.WAIT_BOTH_START else 'next_round',
-            }
-            marker_event = None
-            if self.marker_bridge is not None:
-                marker_event = self.marker_bridge.enqueue('BUTTON_PRESS', marker_payload)
-            log_payload = dict(marker_payload)
-            if marker_event is not None:
-                log_payload['marker'] = marker_event
-            self.log_event(who, action, log_payload)
-        if self.p1_pressed and self.p2_pressed:
-            # in nächste Phase
-            self.p1_pressed = False
-            self.p2_pressed = False
-            # Hotfix: if fixation just finished, require a second press and remain in WAIT_BOTH_START
-            if getattr(self, '_fixation_just_finished', False) and self.phase == UXPhase.WAIT_BOTH_START:
-                self._fixation_just_finished = False
-                # Re-apply the phase to keep the waiting screen active; do not advance
-                self.apply_phase()
+        timer_ns = self._handler_timer_start()
+        try:
+            if self.session_finished and not self.in_block_pause:
                 return
-            if self.in_round_pause:
-                self.in_round_pause = False
-                self.pause_message = ''
-                self.update_pause_overlay()
-                self.prepare_next_round(start_immediately=True)
+            allowed_phase = self.phase in (UXPhase.WAIT_BOTH_START, UXPhase.SHOWDOWN)
+            if not allowed_phase and not self.in_block_pause:
                 return
-            if self.in_block_pause:
-                self.in_block_pause = False
-                self.pause_message = ''
-                self.update_pause_overlay()
-                self.setup_round()
-                if self.session_finished:
+            if who == 1:
+                self.p1_pressed = True
+            else:
+                self.p2_pressed = True
+            self.record_action(who, 'Play gedrückt')
+            if self.session_configured:
+                action = 'start_click' if self.phase == UXPhase.WAIT_BOTH_START else 'next_round_click'
+                marker_payload = {
+                    'actor': self._actor_label(who),
+                    'phase': getattr(self.phase, 'name', str(self.phase)),
+                    'round_idx': max(0, self.round - 1),
+                    'button': 'start' if self.phase == UXPhase.WAIT_BOTH_START else 'next_round',
+                }
+                marker_event = self._emit_marker('BUTTON_PRESS', marker_payload)
+                log_payload = dict(marker_payload)
+                if marker_event is not None:
+                    log_payload['marker'] = marker_event
+                self.log_event(who, action, log_payload)
+            if self.p1_pressed and self.p2_pressed:
+                # in nächste Phase
+                self.p1_pressed = False
+                self.p2_pressed = False
+                # Hotfix: if fixation just finished, require a second press and remain in WAIT_BOTH_START
+                if getattr(self, '_fixation_just_finished', False) and self.phase == UXPhase.WAIT_BOTH_START:
+                    self._fixation_just_finished = False
+                    # Re-apply the phase to keep the waiting screen active; do not advance
                     self.apply_phase()
                     return
-                self.phase = UXPhase.WAIT_BOTH_START
-                self.apply_phase()
-                self.continue_after_start_press()
-                return
-            elif self.phase == UXPhase.SHOWDOWN:
-                self.prepare_next_round(start_immediately=True)
-                return
-            else:
-                self.continue_after_start_press()
+                if self.in_round_pause:
+                    self.in_round_pause = False
+                    self.pause_message = ''
+                    self.update_pause_overlay()
+                    self.prepare_next_round(start_immediately=True)
+                    return
+                if self.in_block_pause:
+                    self.in_block_pause = False
+                    self.pause_message = ''
+                    self.update_pause_overlay()
+                    self.setup_round()
+                    if self.session_finished:
+                        self.apply_phase()
+                        return
+                    self.phase = UXPhase.WAIT_BOTH_START
+                    self.apply_phase()
+                    self.continue_after_start_press()
+                    return
+                elif self.phase == UXPhase.SHOWDOWN:
+                    self.prepare_next_round(start_immediately=True)
+                    return
+                else:
+                    self.continue_after_start_press()
+        finally:
+            self._handler_timer_end('start_pressed', timer_ns)
 
     def run_fixation_sequence(self, on_complete=None):
         def _after_fixation_wrapper():
@@ -917,20 +1034,22 @@ class TabletopRoot(FloatLayout):
         self.fixation_player(self)
 
     def tap_card(self, who:int, which:str):
-        result = self.controller.tap_card(who, which)
-        if not result.allowed:
+        if not self._input_debouncer.allow(f'tap:{who}:{which}'):
             return
-        widget = self.card_widget_for_player(who, which)
-        if widget is None:
-            return
-        widget.flip()
-        if result.record_text:
-            self.record_action(who, result.record_text)
-        if result.log_action:
-            log_payload = dict(result.log_payload or {})
-            marker_event = None
-            if self.marker_bridge is not None:
-                marker_event = self.marker_bridge.enqueue(
+        timer_ns = self._handler_timer_start()
+        try:
+            result = self.controller.tap_card(who, which)
+            if not result.allowed:
+                return
+            widget = self.card_widget_for_player(who, which)
+            if widget is None:
+                return
+            widget.flip()
+            if result.record_text:
+                self.record_action(who, result.record_text)
+            if result.log_action:
+                log_payload = dict(result.log_payload or {})
+                marker_event = self._emit_marker(
                     'TOUCH_CARD',
                     {
                         'actor': self._actor_label(who),
@@ -938,31 +1057,35 @@ class TabletopRoot(FloatLayout):
                         'round_idx': max(0, self.round - 1),
                     },
                 )
-            if marker_event is not None:
-                log_payload.setdefault('marker', marker_event)
-            self.log_event(who, result.log_action, log_payload)
-        if result.next_phase:
-            Clock.schedule_once(lambda *_: self.goto(result.next_phase), 0.2)
+                if marker_event is not None:
+                    log_payload.setdefault('marker', marker_event)
+                self.log_event(who, result.log_action, log_payload)
+            if result.next_phase:
+                Clock.schedule_once(lambda *_: self.goto(result.next_phase), 0.2)
+        finally:
+            self._handler_timer_end('tap_card', timer_ns)
 
     def pick_signal(self, player:int, level:str):
-        result = self.controller.pick_signal(player, level)
-        if not result.accepted:
+        if not self._input_debouncer.allow(f'signal:{player}:{level}'):
             return
-        for lvl, btn_id in self.signal_buttons.get(player, {}).items():
-            btn = self.wid_safe(btn_id)
-            if btn is None:
-                continue
-            if lvl == level:
-                btn.set_pressed_state()
-            else:
-                btn.set_live(False)
-                btn.disabled = True
-        self.record_action(player, f'Signal gewählt: {self.describe_level(level)}')
-        if result.log_payload:
-            log_payload = dict(result.log_payload)
-            marker_event = None
-            if self.marker_bridge is not None:
-                marker_event = self.marker_bridge.enqueue(
+        timer_ns = self._handler_timer_start()
+        try:
+            result = self.controller.pick_signal(player, level)
+            if not result.accepted:
+                return
+            for lvl, btn_id in self.signal_buttons.get(player, {}).items():
+                btn = self.wid_safe(btn_id)
+                if btn is None:
+                    continue
+                if lvl == level:
+                    btn.set_pressed_state()
+                else:
+                    btn.set_live(False)
+                    btn.disabled = True
+            self.record_action(player, f'Signal gewählt: {self.describe_level(level)}')
+            if result.log_payload:
+                log_payload = dict(result.log_payload)
+                marker_event = self._emit_marker(
                     'BUTTON_PRESS',
                     {
                         'actor': self._actor_label(player),
@@ -970,33 +1093,37 @@ class TabletopRoot(FloatLayout):
                         'round_idx': max(0, self.round - 1),
                     },
                 )
-            if marker_event is not None:
-                log_payload.setdefault('marker', marker_event)
-            self.log_event(player, 'signal_choice', log_payload)
-        self.update_user_displays()
-        if result.next_phase:
-            Clock.schedule_once(lambda *_: self.goto(result.next_phase), 0.2)
+                if marker_event is not None:
+                    log_payload.setdefault('marker', marker_event)
+                self.log_event(player, 'signal_choice', log_payload)
             self.update_user_displays()
+            if result.next_phase:
+                Clock.schedule_once(lambda *_: self.goto(result.next_phase), 0.2)
+                self.update_user_displays()
+        finally:
+            self._handler_timer_end('pick_signal', timer_ns)
 
     def pick_decision(self, player:int, decision:str):
-        result = self.controller.pick_decision(player, decision)
-        if not result.accepted:
+        if not self._input_debouncer.allow(f'decision:{player}:{decision}'):
             return
-        for choice, btn_id in self.decision_buttons.get(player, {}).items():
-            btn = self.wid_safe(btn_id)
-            if btn is None:
-                continue
-            if choice == decision:
-                btn.set_pressed_state()
-            else:
-                btn.set_live(False)
-                btn.disabled = True
-        self.record_action(player, f'Entscheidung: {decision.upper()}')
-        if result.log_payload:
-            log_payload = dict(result.log_payload)
-            marker_event = None
-            if self.marker_bridge is not None:
-                marker_event = self.marker_bridge.enqueue(
+        timer_ns = self._handler_timer_start()
+        try:
+            result = self.controller.pick_decision(player, decision)
+            if not result.accepted:
+                return
+            for choice, btn_id in self.decision_buttons.get(player, {}).items():
+                btn = self.wid_safe(btn_id)
+                if btn is None:
+                    continue
+                if choice == decision:
+                    btn.set_pressed_state()
+                else:
+                    btn.set_live(False)
+                    btn.disabled = True
+            self.record_action(player, f'Entscheidung: {decision.upper()}')
+            if result.log_payload:
+                log_payload = dict(result.log_payload)
+                marker_event = self._emit_marker(
                     'BUTTON_PRESS',
                     {
                         'actor': self._actor_label(player),
@@ -1004,13 +1131,15 @@ class TabletopRoot(FloatLayout):
                         'round_idx': max(0, self.round - 1),
                     },
                 )
-            if marker_event is not None:
-                log_payload.setdefault('marker', marker_event)
-            self.log_event(player, 'call_choice', log_payload)
-        self.update_user_displays()
-        if result.next_phase:
-            Clock.schedule_once(lambda *_: self.goto(result.next_phase), 0.2)
+                if marker_event is not None:
+                    log_payload.setdefault('marker', marker_event)
+                self.log_event(player, 'call_choice', log_payload)
             self.update_user_displays()
+            if result.next_phase:
+                Clock.schedule_once(lambda *_: self.goto(result.next_phase), 0.2)
+                self.update_user_displays()
+        finally:
+            self._handler_timer_end('pick_decision', timer_ns)
 
     def goto(self, phase):
         self.phase = phase
