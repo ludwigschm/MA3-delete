@@ -11,6 +11,18 @@ import numpy as np
 import sounddevice as sd
 import threading
 
+
+def _send_sync_event(_name: str) -> None:
+    """
+    Hotfix: No-op sync hook to mirror legacy behavior without external deps.
+    Intentionally does nothing but guards against exceptions.
+    """
+
+    try:
+        pass
+    except Exception:
+        pass
+
 _FIXATION_CROSS_ATTR = "_fixation_cross_overlay"
 
 _GRAPHICS_SPEC = importlib.util.find_spec("kivy.graphics")
@@ -137,6 +149,7 @@ def run_fixation_sequence(
         if callback:
             callback()
         _log_fixation_event("fixation_end")
+        _send_sync_event("sync.fixation_end")
 
     def show_final_live(_dt: float) -> None:
         _set_image_source(image, live_image, fallback="cross")
@@ -146,6 +159,7 @@ def run_fixation_sequence(
         _set_image_source(image, stop_image, fallback="blank")
         play_fixation_tone(controller)
         _log_fixation_event("fixation_beep")
+        _send_sync_event("sync.flash_beep")
         schedule_once(show_final_live, 0.2)
 
     schedule_once(show_stop_and_tone, 5)
