@@ -22,3 +22,14 @@ Für UI-/Spiel-Events wird vor dem Schreiben/Versenden die Hilfsfunktion
 gemeinsamen Felder `actor`, `game_player`, `player_role`, `phase` und
 `round_idx`, sodass Marker-Bridge, MarkerHub und Log-Dateien konsistente
 Metadaten enthalten.
+
+## Eye-Tracking (Neon)
+
+Setze die Endpunkte als Umgebungsvariablen:
+- `NEON_P1=192.168.1.20:8080`
+- `NEON_P2=192.168.1.21:8080`
+
+Beim Start werden:
+- ET-Marker für alle UI-Events gespiegelt (kritische `fix.*`/`sync.*` ohne Host-Zeit).
+- Fixation `flash_start`/`flash_end` zusätzlich als SyncPairs in `sync_pairs` protokolliert.
+- (Optional) Dummy-Gaze-Stream schreibt in `gaze_samples` – kann leicht durch Neon-SDK ersetzt werden.
