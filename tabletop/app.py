@@ -488,6 +488,12 @@ class TabletopApp(App):
             root.overlay_process = process_handle
 
         if root is not None:
+            stop_gaze = getattr(root, "stop_gaze_streams", None)
+            if callable(stop_gaze):
+                try:
+                    stop_gaze()
+                except Exception:
+                    pass
             logger = getattr(root, "logger", None)
             if logger is not None:
                 close_fn = getattr(logger, "close", None)
