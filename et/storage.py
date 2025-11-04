@@ -4,6 +4,7 @@ import csv
 import sqlite3
 import threading
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
@@ -65,3 +66,23 @@ class ETStorage:
         if self.paths.csv_sync:
             with self.paths.csv_sync.open("a", encoding="utf-8", newline="") as fp:
                 csv.writer(fp).writerows(rows)
+
+    def write_single_sync(
+        self,
+        session_id: str,
+        player: str,
+        kind: str,
+        t_host_ns: int,
+        t_device_ns: int,
+    ) -> None:
+        delta = int(t_device_ns) - int(t_host_ns)
+        row = (
+            session_id,
+            player,
+            kind,
+            int(t_host_ns),
+            int(t_device_ns),
+            delta,
+            datetime.now(timezone.utc).isoformat(),
+        )
+        self.write_sync([row])
