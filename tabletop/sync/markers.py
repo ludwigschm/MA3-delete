@@ -1,4 +1,4 @@
-"""Central marker distribution hub for LSL/UDP/eye-tracker annotations."""
+"""Central marker distribution hub for LSL and UDP annotations."""
 
 from __future__ import annotations
 
@@ -14,8 +14,6 @@ import threading
 from typing import Any, Optional
 import time
 
-from .neon_manager import EyeTrackerManager
-
 log = logging.getLogger(__name__)
 
 
@@ -25,11 +23,9 @@ class MarkerHub:
     def __init__(
         self,
         *,
-        eye_tracker: Optional[EyeTrackerManager] = None,
         udp_port: int = 5005,
         queue_maxsize: int = 1000,
     ) -> None:
-        self._eye_tracker = eye_tracker
         self._udp_port = udp_port
         self._queue: Queue[dict[str, Any]] = Queue(maxsize=queue_maxsize)
         self._sentinel: object = object()
@@ -128,11 +124,6 @@ class MarkerHub:
         encoded = json.dumps(event, ensure_ascii=False)
         self._send_udp(encoded)
         self._send_lsl(encoded, event)
-        if self._eye_tracker is not None:
-            try:
-                self._eye_tracker.annotate(event["kind"], event)
-            except Exception:  # pragma: no cover - defensive
-                log.exception("Eye tracker annotation failed for %s", event["kind"])
         # TODO: Provide hook for optional hardware strobe integration.
 
     def _send_udp(self, payload: str) -> None:

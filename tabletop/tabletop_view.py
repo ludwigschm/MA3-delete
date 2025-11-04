@@ -56,7 +56,6 @@ from tabletop.ui.assets import (
 )
 from tabletop.ui.widgets import CardWidget, IconButton, RotatableLabel
 from tabletop.sync.markers import MarkerHub
-from tabletop.sync.neon_manager import EyeTrackerManager
 from tabletop.sync.estimator import write_sync_report
 
 log = logging.getLogger(__name__)
@@ -179,7 +178,6 @@ class TabletopRoot(FloatLayout):
 
         self.marker_hub: Optional[MarkerHub] = None
         self.marker_bridge: Optional[EventBridge] = None
-        self.eye_tracker_manager: Optional[EyeTrackerManager] = None
         self._sync_report_writer = write_sync_report
         self._sync_report_path: Optional[Path] = None
         self._sync_session_started = False
@@ -225,7 +223,6 @@ class TabletopRoot(FloatLayout):
         *,
         marker_hub: Optional[MarkerHub] = None,
         marker_bridge: Optional[EventBridge] = None,
-        eye_tracker_manager: Optional[EyeTrackerManager] = None,
         report_writer: Optional[Callable[[str, dict[str, Any]], None]] = None,
     ) -> None:
         """Inject synchronisation helpers provided by the application."""
@@ -234,8 +231,6 @@ class TabletopRoot(FloatLayout):
             self.marker_hub = marker_hub
         if marker_bridge is not None:
             self.marker_bridge = marker_bridge
-        if eye_tracker_manager is not None:
-            self.eye_tracker_manager = eye_tracker_manager
         if report_writer is not None:
             self._sync_report_writer = report_writer
 
@@ -419,11 +414,6 @@ class TabletopRoot(FloatLayout):
         if self._sync_session_started or not self.session_id:
             return
         session_id = self.session_id
-        if self.eye_tracker_manager is not None:
-            try:
-                self.eye_tracker_manager.start_all(session_id)
-            except Exception:  # pragma: no cover - defensive
-                log.exception("Starting Neon devices failed")
         base_payload = {
             'session': session_id,
             'block': self.start_block,
@@ -444,11 +434,6 @@ class TabletopRoot(FloatLayout):
         if not self._sync_session_started:
             if not force:
                 return
-            if self.eye_tracker_manager is not None:
-                try:
-                    self.eye_tracker_manager.stop_all()
-                except Exception:  # pragma: no cover - defensive
-                    log.exception("Stopping Neon devices failed")
             self._write_sync_report(reason=reason)
             self._sync_session_stopped = True
             return
@@ -465,11 +450,6 @@ class TabletopRoot(FloatLayout):
         if marker_event is not None:
             log_payload['marker'] = marker_event
         self.log_event(None, 'EXP_STOP', log_payload)
-        if self.eye_tracker_manager is not None:
-            try:
-                self.eye_tracker_manager.stop_all()
-            except Exception:  # pragma: no cover - defensive
-                log.exception("Stopping Neon devices failed")
         self._schedule_io_task(
             lambda: self._write_sync_report(reason=reason),
             description='sync_report',
@@ -1782,11 +1762,6 @@ class TabletopRoot(FloatLayout):
                 self.marker_hub.shutdown()
             except Exception:  # pragma: no cover - defensive
                 log.debug("Marker hub shutdown raised", exc_info=True)
-        if self.eye_tracker_manager is not None:
-            try:
-                self.eye_tracker_manager.shutdown()
-            except Exception:  # pragma: no cover - defensive
-                log.debug("Eye tracker manager shutdown raised", exc_info=True)
 
     def record_action(self, player:int, text:str):
         self.status_lines[player].append(text)
