@@ -5,15 +5,11 @@ from __future__ import annotations
 import importlib
 import importlib.util
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 import numpy as np
 import sounddevice as sd
 import threading
-
-if TYPE_CHECKING:
-    from tabletop.pupil_bridge import PupilBridge
-
 
 _FIXATION_CROSS_ATTR = "_fixation_cross_overlay"
 
@@ -75,9 +71,7 @@ def run_fixation_sequence(
     stop_image: Optional[Path | str],
     live_image: Optional[Path | str],
     on_complete: Optional[Callable[[], None]] = None,
-    bridge: Optional["PupilBridge"] = None,
     players: Optional[Iterable[str]] = None,
-    player: Optional[str] = None,
     session: Optional[int] = None,
     block: Optional[int] = None,
 ) -> None:
@@ -95,25 +89,7 @@ def run_fixation_sequence(
             on_complete()
         return
 
-    player_targets = {
-        p for p in (players or []) if p
-    }
-    if player:
-        player_targets.add(player)
-    player_list = tuple(sorted(player_targets))
-
-    def _send_sync_event(name: str) -> None:
-        if bridge is None or not player_list:
-            return
-        for target in player_list:
-            if not bridge.is_connected(target):
-                continue
-            payload: dict[str, Any] = {"player": target}
-            if session is not None:
-                payload["session"] = session
-            if block is not None:
-                payload["block"] = block
-            bridge.send_event(name, target, payload)
+    player_list = tuple(sorted(p for p in (players or []) if p))
 
     def _log_fixation_event(kind: str) -> None:
         log_event = getattr(controller, "log_event", None)
@@ -169,7 +145,6 @@ def run_fixation_sequence(
         play_fixation_tone(controller)
         if hasattr(controller, "fixation_beep_callback"):
             controller.fixation_beep_callback = None
-        _send_sync_event("sync.flash_beep")
         schedule_once(show_final_live, 0.2)
 
     schedule_once(show_stop_and_tone, 5)
