@@ -97,7 +97,31 @@ def run_fixation_sequence(
             return
         payload: dict[str, Any] = {}
         if player_list:
-            payload["players"] = list(player_list)
+            player_roles = getattr(controller, "player_roles", None)
+            mapped_players: list[str] = []
+            for player in player_list:
+                role_value: Optional[int] = None
+                if isinstance(player_roles, dict):
+                    key: Optional[int]
+                    if isinstance(player, int):
+                        key = player
+                    else:
+                        key = int(player) if str(player).isdigit() else None
+                    if key is not None:
+                        role = player_roles.get(key)
+                        if isinstance(role, int):
+                            role_value = role
+                if role_value in (1, 2):
+                    mapped_players.append(f"p{role_value}")
+                    continue
+                player_str = str(player).lower()
+                if player_str in ("p1", "p2"):
+                    mapped_players.append(player_str)
+                elif player_str in ("1", "2"):
+                    mapped_players.append(f"p{player_str}")
+                else:
+                    mapped_players.append(str(player))
+            payload["players"] = mapped_players
         if session is not None:
             payload["session"] = session
         if block is not None:
