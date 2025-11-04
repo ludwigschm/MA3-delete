@@ -5,7 +5,7 @@ import itertools
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -285,6 +285,7 @@ class TabletopRoot(FloatLayout):
         self.et_bridge = ETMarkerBridge(p1, p2)
         # ETStorage nutzt dasselbe DB-File; optional CSV ins Log-Verzeichnis
         self.et_storage = ETStorage(str(db_path), csv_dir=str(self.log_dir))
+        self.start_gaze_streams()
         init_round_log(self)
         self.update_role_assignments()
 
@@ -1534,6 +1535,43 @@ class TabletopRoot(FloatLayout):
         header = [f"Du bist Spieler {player}", f"Rolle: {role}"]
         body = self.status_lines[player]
         self.status_labels[player].text = "\n".join(header + body)
+
+    def start_gaze_streams(self) -> None:
+        if not getattr(self, "et_storage", None):
+            return
+        from et.gaze_stream import GazeStream, GazeSample
+
+        self._gaze_streams = []
+
+        def on_sample(sample: GazeSample):
+            try:
+                row = (
+                    self.session_id,
+                    sample.player,
+                    float(sample.x),
+                    float(sample.y),
+                    (None if sample.conf is None else float(sample.conf)),
+                    int(sample.t_device_ns),
+                    int(sample.t_host_ns),
+                    int(time.perf_counter_ns()),
+                    datetime.now(timezone.utc).isoformat(),
+                )
+                self.et_storage.write_gaze([row])
+            except Exception:
+                pass
+
+        for player in ("p1", "p2"):
+            gs = GazeStream(player, on_sample)
+            gs.start()
+            self._gaze_streams.append(gs)
+
+    def stop_gaze_streams(self) -> None:
+        for gs in getattr(self, "_gaze_streams", []) or []:
+            try:
+                gs.stop()
+            except Exception:
+                pass
+        self._gaze_streams = []
 
 
 __all__ = ["TabletopRoot"]
