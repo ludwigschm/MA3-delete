@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
-import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
@@ -98,51 +97,14 @@ def run_fixation_sequence(
             return
         payload: dict[str, Any] = {}
         if player_list:
-            player_roles = getattr(controller, "player_roles", None)
-            mapped_players: list[str] = []
-            for player in player_list:
-                role_value: Optional[int] = None
-                if isinstance(player_roles, dict):
-                    key: Optional[int]
-                    if isinstance(player, int):
-                        key = player
-                    else:
-                        key = int(player) if str(player).isdigit() else None
-                    if key is not None:
-                        role = player_roles.get(key)
-                        if isinstance(role, int):
-                            role_value = role
-                if role_value in (1, 2):
-                    mapped_players.append(f"p{role_value}")
-                    continue
-                player_str = str(player).lower()
-                if player_str in ("p1", "p2"):
-                    mapped_players.append(player_str)
-                elif player_str in ("1", "2"):
-                    mapped_players.append(f"p{player_str}")
-                else:
-                    mapped_players.append(str(player))
-            payload["players"] = mapped_players
+            payload["players"] = [
+                "p1" if str(p) in ("1", "p1") else "p2" for p in player_list
+            ]
         if session is not None:
             payload["session"] = session
         if block is not None:
             payload["block"] = block
-        log_event(None, kind, payload or None)
-        if kind in {"fix.flash_start", "fix.flash_end"}:
-            try:
-                sess = getattr(controller, "session_id", None)
-                storage = getattr(controller, "et_storage", None)
-                clients = getattr(controller, "et_clients", {})
-                if sess and storage and clients:
-                    t_host = time.time_ns()
-                    for p in (player_list or []):
-                        key = "p1" if str(p) in ("1", "p1") else "p2"
-                        cli = clients.get(key)
-                        if cli:
-                            t_dev = cli.unix_time_ns()
-                            storage.write_single_sync(sess, key, kind, t_host, t_dev)
-            except Exception:
-                pass
+        log_event(None, f"fix.{kind}", payload or None)
 
     controller.fixation_running = True
     controller.pending_fixation_callback = on_complete
