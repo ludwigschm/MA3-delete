@@ -50,6 +50,10 @@ from tabletop.ui.assets import (
     resolve_background_texture,
 )
 from tabletop.ui.widgets import CardWidget, IconButton, RotatableLabel
+from et.config import load_from_env
+from et.neon_client import NeonClient
+from et.marker_bridge import ETMarkerBridge
+from et.storage import ETStorage
 
 Window.multitouch_on_demand = True
 
@@ -162,6 +166,9 @@ class TabletopRoot(FloatLayout):
         self.session_id = None
         self.session_storage_id = None
         self.logger = None
+        self.et_clients = {"p1": None, "p2": None}
+        self.et_bridge = None
+        self.et_storage = None
         self.log_dir = Path(ROOT) / 'logs'
         self.session_popup = None
         self.session_configured = False
@@ -268,6 +275,16 @@ class TabletopRoot(FloatLayout):
         db_path = self.log_dir / f'events_{safe_session_id}.sqlite3'
         self.session_storage_id = safe_session_id
         self.logger = self.events_factory(self.session_id, str(db_path))
+        # --- Eye Tracking bootstrap -----------------------------------------
+        from et.config import load_from_env
+
+        cfg = load_from_env()
+        p1 = NeonClient(cfg.p1) if cfg.p1 else None
+        p2 = NeonClient(cfg.p2) if cfg.p2 else None
+        self.et_clients = {"p1": p1, "p2": p2}
+        self.et_bridge = ETMarkerBridge(p1, p2)
+        # ETStorage nutzt dasselbe DB-File; optional CSV ins Log-Verzeichnis
+        self.et_storage = ETStorage(str(db_path), csv_dir=str(self.log_dir))
         init_round_log(self)
         self.update_role_assignments()
 
@@ -1316,7 +1333,7 @@ class TabletopRoot(FloatLayout):
         payload = payload or {}
         actor = self._actor_label(player)
         round_idx = max(0, self.round - 1)
-        self.logger.log(
+        event = self.logger.log(
             round_idx,
             self.current_engine_phase(),
             actor,
@@ -1324,6 +1341,13 @@ class TabletopRoot(FloatLayout):
             payload,
         )
         write_round_log(self, actor, action, payload, player)
+        # Eye-Tracking Marker Bridge spiegeln
+        if getattr(self, "et_bridge", None):
+            try:
+                self.et_bridge.handle_ui_event(event)
+            except Exception:
+                pass
+        return event
 
     def prompt_session_number(self):
         if self.session_popup:
