@@ -197,6 +197,21 @@ class TabletopRoot(FloatLayout):
         else:
             Clock.schedule_once(lambda *_: self.prompt_session_number(), 0.1)
 
+    async def ensure_recording(self, label: str | None = None) -> None:
+        from core.recording import RecordingController
+
+        clients = getattr(self, "et_clients", {})
+        for key in ("p1", "p2"):
+            cli = clients.get(key)
+            if not cli:
+                continue
+            try:
+                await RecordingController(cli).ensure_started(
+                    label=label or self.session_id
+                )
+            except Exception:
+                pass
+
     def __setattr__(self, key, value):
         if key in self._STATE_FIELDS and 'controller' in self.__dict__:
             setattr(self.controller.state, key, value)
