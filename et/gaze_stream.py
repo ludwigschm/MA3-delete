@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Callable, Optional
 import threading
 import time
+from dataclasses import dataclass
+from typing import Callable, Optional
 
 
 @dataclass(slots=True)
 class GazeSample:
-    player: str     # "p1"/"p2"
-    x: float        # normalized 0..1
+    player: str
+    x: float
     y: float
     conf: float | None
     t_device_ns: int
@@ -17,11 +17,7 @@ class GazeSample:
 
 
 class GazeStream:
-    """
-    Platzhalter-Stream:
-    - bremst nicht, läuft no-op wenn kein SDK vorhanden
-    - Callback wird mit GazeSample aufgerufen
-    """
+    """Dummy-Stream (Platzhalter). Ersetzt später durch echtes Neon-API."""
 
     def __init__(self, player: str, on_sample: Callable[[GazeSample], None]) -> None:
         self.player = player
@@ -35,8 +31,7 @@ class GazeStream:
 
         def loop() -> None:
             while not self._stop:
-                # hier später SDK-Integration (Neon fused gaze)
-                time.sleep(0.05)
+                time.sleep(0.05)  # 20 Hz no-op
 
         self._t = threading.Thread(target=loop, name=f"GazeStream-{self.player}", daemon=True)
         self._t.start()
