@@ -22,4 +22,4 @@ def load_from_env() -> ETConfig:
             return NeonEndpoint(host.strip(), int(port))
         return NeonEndpoint(val.strip(), 8080)
 
-    return ETConfig(p1=parse("NEON_P1"), p2=parse("NEON_P2"))
+    return ETConfig(parse("NEON_P1"), parse("NEON_P2"))
