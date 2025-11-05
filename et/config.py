@@ -23,3 +23,11 @@ def load_from_env() -> ETConfig:
         return NeonEndpoint(val.strip(), 8080)
 
     return ETConfig(parse("NEON_P1"), parse("NEON_P2"))
+
+
+WS_CANDIDATE_PATHS = (
+    "/ws/gaze",  # bevorzugt
+    "/ws",  # fallback
+    "/realtime",  # fallback
+)
+WS_CONNECT_TIMEOUT_S = float(os.getenv("NEON_WS_TIMEOUT_S", "3.0"))

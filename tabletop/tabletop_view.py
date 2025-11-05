@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import csv
 import itertools
 import logging
@@ -1557,6 +1558,12 @@ class TabletopRoot(FloatLayout):
             return
         from et.gaze_stream import GazeStream, GazeSample
 
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.get_event_loop_policy().get_event_loop()
+
+        clients = getattr(self, "et_clients", {})
         self._gaze_streams = []
 
         def on_sample(s: GazeSample):
@@ -1576,8 +1583,11 @@ class TabletopRoot(FloatLayout):
             except Exception:
                 pass
 
-        for player in ("p1", "p2"):
-            gs = GazeStream(player, on_sample)
+        for key in ("p1", "p2"):
+            cli = clients.get(key)
+            if not cli:
+                continue
+            gs = GazeStream(key, cli.endpoint, on_sample)
             gs.start()
             self._gaze_streams.append(gs)
 
