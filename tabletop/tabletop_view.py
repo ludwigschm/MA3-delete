@@ -923,6 +923,7 @@ class TabletopRoot(FloatLayout):
             self.pause_message = message
             self.update_pause_overlay()
             self.update_user_displays()
+            self.stop_gaze_streams()
             return
         if result.in_block_pause:
             self.in_block_pause = True
@@ -1552,22 +1553,22 @@ class TabletopRoot(FloatLayout):
         self.status_labels[player].text = "\n".join(header + body)
 
     def start_gaze_streams(self) -> None:
-        if not getattr(self, "et_storage", None):
+        if not self.et_storage:
             return
         from et.gaze_stream import GazeStream, GazeSample
 
         self._gaze_streams = []
 
-        def on_sample(sample: GazeSample):
+        def on_sample(s: GazeSample):
             try:
                 row = (
                     self.session_id,
-                    sample.player,
-                    float(sample.x),
-                    float(sample.y),
-                    (None if sample.conf is None else float(sample.conf)),
-                    int(sample.t_device_ns),
-                    int(sample.t_host_ns),
+                    s.player,
+                    float(s.x),
+                    float(s.y),
+                    (None if s.conf is None else float(s.conf)),
+                    int(s.t_device_ns),
+                    int(s.t_host_ns),
                     int(time.perf_counter_ns()),
                     datetime.now(timezone.utc).isoformat(),
                 )
