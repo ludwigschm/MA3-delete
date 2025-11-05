@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
@@ -105,6 +106,26 @@ def run_fixation_sequence(
         if block is not None:
             payload["block"] = block
         log_event(None, f"fix.{kind}", payload or None)
+        if kind in {"flash_start", "flash_end"}:
+            try:
+                sess = getattr(controller, "session_id", None)
+                storage = getattr(controller, "et_storage", None)
+                clients = getattr(controller, "et_clients", {})
+                players = [
+                    "p1" if str(p) in ("1", "p1") else "p2"
+                    for p in (player_list or ["p1", "p2"])
+                ]
+                if sess and storage and clients:
+                    t_host = time.time_ns()
+                    for key in players:
+                        cli = clients.get(key)
+                        if cli:
+                            t_dev = cli.unix_time_ns()
+                            storage.write_single_sync(
+                                sess, key, f"fix.{kind}", t_host, t_dev
+                            )
+            except Exception:
+                pass
 
     controller.fixation_running = True
     controller.pending_fixation_callback = on_complete
